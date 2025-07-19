@@ -58,8 +58,10 @@ import nvdiffrast.torch as dr
 
 ToPILImage = transforms.ToPILImage()
 
+# 核心类, 包含三阶段的手物对齐和优化
 class HOI_Sync:
     def __init__(self, cfg:CfgNode, progress_bar):
+        # 输入:cfg, 包含 MANO模型, 损失函数权重, 优化迭代次数
         super().__init__()
         # Instantiate MANO model
         self.cfg = cfg
@@ -83,7 +85,7 @@ class HOI_Sync:
                           'obj': [('scale',1), ('transl',3), ('orient',3)]}
         if "hand_scale" not in cfg:
             self.global_params = {
-                'hand': torch.FloatTensor([5, 0, 0, 0]).to(self.device),
+                'hand': torch.FloatTensor([1, 0, 0, 0]).to(self.device),
                 'obj': torch.FloatTensor([1, 0,0,0, 0,0,0]).to(self.device),
             }
         else:
@@ -144,6 +146,7 @@ class HOI_Sync:
             offset += dim
         return res
         
+    # 获取pipeline的输入数据, 通过data_item传入
     def get_data(self, data_item, **kwarg):
         self.data = data_item
         self.mano_params = data_item["mano_params"]
@@ -355,7 +358,7 @@ class HOI_Sync:
             "optimizer": torch.optim.Adam, 
             "remesh": [50,100,150], 
         }
-        
+        # 物体mesh
         verts = self.data["object_verts"]
         tri = self.data["object_faces"].int()
         color_obj = torch.FloatTensor([0, 1, 0]).repeat(verts.shape[1], 1)
@@ -365,6 +368,7 @@ class HOI_Sync:
         optimizer = params.get("optimizer", torch.optim.Adam) # Which optimizer to use
         
         
+        # projections 表示物体相机的投影矩阵，为4x4的torch.Tensor，用于将三维点投影到二维图像平面
         projections = self.data["obj_cam"]["projection"]
         
         c2ws = self.data["obj_cam"]["extrinsics"]
@@ -374,7 +378,7 @@ class HOI_Sync:
         projections_origin = projections.clone()
         projections_residual = torch.nn.Parameter(torch.zeros((4, 4), device=device, dtype=projections_origin.dtype))
         # projections_residual = torch.nn.Parameter(torch.zeros((1), device=device, dtype=projections_origin.dtype))
-        projections_mask = torch.tensor([
+        projections_mask = torch.tensor([   # 相机内参的mask, 只优化fx fy
                 [1., 0., 0., 0.], 
                 [0., 1., 0., 0.], 
                 [0., 0., 0., 0.], 
@@ -442,7 +446,7 @@ class HOI_Sync:
         
         self.data["obj_cam"]["projection"] = projections.detach()
         self.data["obj_cam"]["extrinsics"] = c2ws.detach()[:3, :] # (3, 4)
-        
+        # 深度剥离: 一个像素点对应多个物体表面
         object_depth, object_rast = self.depth_peel(verts, tri, projections, c2ws, resolution,
                                             znear=0.1, zfar=100)  
         self.object_depth = object_depth.squeeze().detach() # [num_layers, H, W]
@@ -454,6 +458,7 @@ class HOI_Sync:
         
         
         hoi_mask = self.data["hamer_hand_mask"].bool() & self.data["inpaint_mask"]
+        # 手遮挡物体
         front_mask = (hoi_mask & self.data["inpaint_mask"] & (~self.data["obj_mask"])).int()
         obj_pts_front, obj_contact_normals_front, contact_mask_front = compute_obj_contact(
             side='obj_front',
@@ -464,7 +469,7 @@ class HOI_Sync:
             rast=self.object_rast
         )
         
-            
+        # 物体遮挡手
         back_mask = (hoi_mask & self.data["inpaint_mask"] & self.data["hamer_hand_mask"].bool() & (~self.data["hand_mask"])).int()
         obj_pts_back, obj_contact_normals_back, contact_mask_back = compute_obj_contact(
             side='obj_back',
@@ -481,10 +486,11 @@ class HOI_Sync:
         else:
             obj_pts = None
             obj_contact_normals = None
-            
+        # 接触点坐标
         self.obj_contact = {'front': obj_pts_front, 
                             'back': obj_pts_back,
                             'both': obj_pts}
+        # 接触点法向量
         self.obj_contact_normals = {'front': obj_contact_normals_front, 
                                     'back': obj_contact_normals_back,
                                     'both': obj_contact_normals}
@@ -696,6 +702,7 @@ class HOI_Sync:
         fullpose = mano_output.full_poses
         return loss, fullpose.detach(), pred_hand_mask.detach(), pred_obj_mask.detach()
     
+    # 定义了2d损失和3d损失, 返回loss
     def optim_handpose_global(self, fullpose, betas, scale=None, use_3d_loss = False):
         mano_output: MANOOutput = self.mano_layer(fullpose, betas)
         if scale is None:
@@ -735,6 +742,7 @@ class HOI_Sync:
             loss_2d = 10 * iou 
         
         if use_3d_loss:
+            # 3d损失包括: 接触点对齐损失, 穿透损失
             penetr_loss, contact_loss = compute_h2o_sdf_loss(self.data["object_sdf"], 
                                                 hand_verts,
                                                 self.hand_contact_zone)
@@ -752,7 +760,7 @@ class HOI_Sync:
                     }, step=self.global_step)
 
         return loss, pred_hand_mask, info, iou.item()
-    
+    # stage3: 抓取姿势优化
     def run_handpose_refine(self, outer_iteration = 10):  
         """ Fix object pose, optimize hand pose"""
         # init param
@@ -767,7 +775,7 @@ class HOI_Sync:
         fullpose_residual.requires_grad_()
         betas.requires_grad_()
         
-        params_group = [
+        params_group = [    # 优化的参数: 全局平移, 手部残差, 形状
             {'params': self.global_params['hand'], 'lr': 1e-2},
             {'params': fullpose_residual, 'lr': 1e-2},
             {'params': betas, 'lr': 1e-4},
@@ -871,7 +879,7 @@ class HOI_Sync:
             pred_hand_mask.save(osp.join(self.cfg.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
             
-                
+    # stage2优化: 手部全局平移
     def run_handpose_global(self):  
         """ Fix object pose, optimize hand pose"""
         # init param
@@ -898,7 +906,9 @@ class HOI_Sync:
         _, init_hand_mask, init_info, iou = self.optim_handpose_global(fullpose, betas)
         
         for outer_iter in range(outer_iteration):    
-            
+        # 接触损失和掩码损失交替优化
+        
+            # 基于梯度, 粗配准
             best_loss = float('inf')
             best_global_params = None
             best_fullpose = None
@@ -906,6 +916,7 @@ class HOI_Sync:
                 self.optimizer.zero_grad()
                 fullpose_new = fullpose.clone()
                 fullpose_new[:,:3] += orient_res
+                # 优化T,R,scale
                 loss, pred_hand_mask, _, _ = self.optim_handpose_global(fullpose_new, betas, 
                                                                         use_3d_loss=use_3d_loss)                     
                 
@@ -920,13 +931,14 @@ class HOI_Sync:
                     best_fullpose = fullpose.detach().clone()
                     best_fullpose[:,:3] += orient_res
                     
-            
+            # 基于icp, 精配准
             if outer_iter < 2:
                 print("run icp")
                 fullpose_new = best_fullpose
                 self.global_params['hand'] = best_global_params
                 hand_mesh, hand_verts, hand_contact, hand_c_normals = self.get_hand_contact(fullpose_new, betas.detach())
-                succ = self.optim_contact(hand_mesh, hand_verts, hand_contact, hand_c_normals) # adjust the transl 
+                # 优化translation, R,scale固定
+                succ = self.optim_contact(hand_mesh, hand_verts, hand_contact, hand_c_normals) 
                 if succ == False:
                     use_3d_loss = True
         
@@ -1050,7 +1062,7 @@ class HOI_Sync:
                 hand_contact[side] = hand_contact[side][self.hand_contact_zone]
                 hand_contact_normal[side] = hand_contact_normal[side][self.hand_contact_zone]
                 hand_contact_normal[side] = torch.Tensor(hand_contact_normal[side]).float().to(self.device)
-            R, t, scale, trans_hand_pts[side], error_3d = icp_with_scale(
+            R, t, scale, trans_hand_pts[side], error_3d = icp_with_scale(   # 优化translation, R,scale固定
                 src_points=hand_contact[side],
                 src_norm=-hand_contact_normal[side], # we hope the hand normal be opposite to object's
                 tgt_points=self.obj_contact[side],
@@ -1066,7 +1078,7 @@ class HOI_Sync:
                                 obj_verts, self.data["object_faces"].squeeze(),
                                 resolution=self.data["resolution"])
             pred_hand_mask = img[...,0]
-            error_2d = soft_iou_loss(pred_hand_mask, gt_hand_mask)
+            error_2d = soft_iou_loss(pred_hand_mask, gt_hand_mask) # 交叉验证, 避免icp陷入局部最优
             error = error_3d + error_2d
             print(side, 'error: ', error.item(), 'error_2d: ', error_2d.item(), 'error_3d: ', error_3d.item())
             

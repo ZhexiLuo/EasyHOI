@@ -138,6 +138,7 @@ def try_until_success(func, max_attempts=5, exception_to_check=Exception, verbos
         print(f"Function failed after {max_attempts} attempts.")
     return None  # Return None if all attempts fail
 
+# 数据加载
 def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     # resize the input image, because the resolution for nvdiffrastmust must be [<=2048, <=2048]
     try:
@@ -202,7 +203,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     with open(bbox_file, "r") as file:
         bbox = json.load(file)  # Directly loads the bbox as a list
     if is_tripo:
-        obj_cam = get_obj_cam_tripo(device, origin_w, origin_h)
+        obj_cam = get_obj_cam_tripo(device, origin_w, origin_h) # 虚拟相机初始化
     else:
         obj_cam = get_obj_cam(device, origin_w, origin_h, bbox)
         
@@ -330,6 +331,7 @@ def main(cfg : DictConfig) -> None:
         hoi_sync = HOI_Sync(cfg=exp_cfg, progress_bar=progress_bar)
         
         """ Find the best match hand """
+        # HAMER 可能从一张图片中检查到多个手, 找到最匹配的手
         min_iou = float('inf')
         for item in hand_infos:
             data_item = load_data_single(data_cfg, file, item["id"], is_tripo)
@@ -377,7 +379,7 @@ def main(cfg : DictConfig) -> None:
         print("optim_obj_cam end:", end_time)
         print("optim_obj_cam takes: ", end_time - start_time)
         hoi_sync.export(prefix="init")
-        # hoi_sync.export_for_eval(prefix="init")
+        hoi_sync.export_for_eval(prefix="init")
         
         # Stage 2: contact alignment
         start_time = time.time()
@@ -387,7 +389,7 @@ def main(cfg : DictConfig) -> None:
         print("contact alignment end:", end_time)
         print("contact alignment takes:", end_time - start_time)
         hoi_sync.export(prefix="after_global")
-        # hoi_sync.export_for_eval(prefix="after_global")
+        hoi_sync.export_for_eval(prefix="after_global")
         
         # Stage 3: hand refine
         start_time = time.time()

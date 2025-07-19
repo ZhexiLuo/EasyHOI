@@ -216,7 +216,7 @@ def compute_h2o_sdf_loss(
     
     voxel = voxel[None, None, :, :, :] #[1, 1, D, H, W]  xyz
     voxel = voxel.expand([B,-1,-1,-1,-1]) #[V, 1, D, H, W]  xyz
-    query_grids = (hand_pts - origin) * scale # [V, 3]    
+    query_grids = (hand_pts - origin) * scale # [V, 3]  | 从世界坐标系转换到物体坐标系, 并缩放
     query_grids = query_grids[:, None, None, None, :] # [V, 1, 1, 1, 3]
     
     # xyz = query_grids.cpu().squeeze()
