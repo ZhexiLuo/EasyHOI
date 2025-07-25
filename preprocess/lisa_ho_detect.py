@@ -81,6 +81,11 @@ def clear_mask(mask, min_area = 20):
 
 def main(args):
     args = parse_args(args)
+
+    LISA_BASE_PATH = "/home/zhexi/project/easyhoi/.cache/LISA/"
+    VISION_TOWER_PATH = "/home/zhexi/project/easyhoi/.cache/openai/clip-vit-large-patch14"
+    args.version = LISA_BASE_PATH
+    args.vision_tower = VISION_TOWER_PATH
     
     data_dir = os.path.abspath(args.data_dir)
     if args.seg_hand:

@@ -1,5 +1,5 @@
 name: teaser_tripo
-base_dir: ./data
+base_dir: ./mydata
 input_dir: ${base_dir}/images
 hand_mask_dir: ${base_dir}/obj_recon/hand_mask
 obj_mask_dir: ${base_dir}/obj_recon/obj_mask

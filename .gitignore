@@ -1,3 +1,7 @@
+assets/mano_v1_2.zip
+glide_model_cache/
+mydata/
+sample_data/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

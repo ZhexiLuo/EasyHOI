@@ -8,7 +8,7 @@ import argparse
 import zipfile
 from tqdm import tqdm
 
-api_key = "tsk_***"
+api_key = "tsk_PHiN82bTWUQT-pkIOCq15YKBb4HmsYBrRJ-VI3ZhAia"
 
 def update_json(file_path, new_items):
     if os.path.exists(file_path):

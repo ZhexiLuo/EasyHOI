@@ -1,8 +1,13 @@
+# @package _global_
+
 defaults:
   - _self_
   - experiments: default
   - data: teaser
 
-log_dir: /storage/data/v-liuym/EasyHOI_results/teaser/log
-out_dir: /storage/data/v-liuym/EasyHOI_results/teaser/
+log_dir: /home/zhexi/project/easyhoi/outputs
+out_dir: /home/zhexi/project/easyhoi/outputs/log
 hand_scale: 10
+
+hydra:
+  run:
