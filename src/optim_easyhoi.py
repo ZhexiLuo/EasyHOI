@@ -2,7 +2,9 @@ import os
 import os.path as osp
 import json
 import random
+import logging
 import hydra
+import colorlog
 from omegaconf import DictConfig, OmegaConf
 import rootutils
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
@@ -16,7 +18,7 @@ import numpy as np
 from mesh_to_sdf import mesh_to_voxels
 from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_axis_angle
 from src.models.hoi_optim_module import HOI_Sync
-
+from src.utils.logging import log_init
 
 from src.utils.cam_utils import (
     load_cam,
@@ -65,17 +67,17 @@ def get_obj_cam(device, w, h, crop_bbox):
     return obj_cam
 
 def get_obj_cam_tripo(device, w, h):
-    DEFAULT_DIST = 3.5
-    DEFAULT_FOV = 30.0
-    focal_length = 0.5 / np.tan(np.deg2rad(DEFAULT_FOV) * 0.5)
-    cam_pose = torch.FloatTensor([DEFAULT_DIST, 0, 0]).cuda()
+    DEFAULT_DIST = 3.5  # 初始距离
+    DEFAULT_FOV = 30.0  # 视野广度, 单位是度
+    focal_length = 0.5 / np.tan(np.deg2rad(DEFAULT_FOV) * 0.5)  # 焦距
+    cam_pose = torch.FloatTensor([DEFAULT_DIST, 0, 0]).cuda()  # 相机位置
     
-    ratio = w/h
-    print("ratio: ", ratio)
+    ratio = w/h  # 宽高比
+    logging.info(f"ratio: {ratio}")
     
     obj_cam = {'fx':focal_length, 'fy': focal_length*ratio, 'cx': 0.5, 'cy': 0.5}
-    obj_cam["extrinsics"] = center_looking_at_camera_pose(cam_pose).to(device)
-    obj_cam["projection"] = torch.FloatTensor(get_projection(obj_cam, width=w, height=h)).to(device)
+    obj_cam["extrinsics"] = center_looking_at_camera_pose(cam_pose).to(device)  # 以物体为中心, 相机朝向原点, 计算相机外参
+    obj_cam["projection"] = torch.FloatTensor(get_projection(obj_cam, width=w, height=h)).to(device)    # 投影矩阵, 将3D坐标投影到2D坐标
     
     return obj_cam
 
@@ -120,7 +122,7 @@ def try_until_success(func, max_attempts=5, exception_to_check=Exception, verbos
 
     for attempt in range(1, max_attempts + 1):
         if verbose:
-            print(f"Attempt {attempt}/{max_attempts}...")
+            logging.info(f"Attempt {attempt}/{max_attempts}...")
 
         try:
             random.seed(attempt)
@@ -129,13 +131,13 @@ def try_until_success(func, max_attempts=5, exception_to_check=Exception, verbos
             return result     # Return the result if successful
         except exception_to_check as e:
             if verbose:
-                print(f"Attempt {attempt} failed: {e}")
+                logging.warning(f"Attempt {attempt} failed: {e}")
             if attempt < max_attempts:
                 if verbose:
-                    print(f"Retrying ...")
+                    logging.info("Retrying ...")
 
     if verbose:
-        print(f"Function failed after {max_attempts} attempts.")
+        logging.error(f"Function failed after {max_attempts} attempts.")
     return None  # Return None if all attempts fail
 
 # 数据加载
@@ -152,7 +154,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     img_fn = file.split(".")[0]
     
     if not os.path.exists(osp.join(cfg.inpaint_dir, f"{img_fn}.png")):
-        print("inpaint image not exist:", osp.join(cfg.inpaint_dir, f"{img_fn}.png"))
+        logging.warning(f"inpaint image not exist: {osp.join(cfg.inpaint_dir, f'{img_fn}.png')}")
         return None
     
     
@@ -169,7 +171,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     obj_mesh_path = osp.join(cfg.obj_dir,img_fn, "fixed.obj")
     
     if not os.path.exists(obj_mesh_path):
-        print("obj mesh not exist:", obj_mesh_path)
+        logging.error(f"【错误】obj 文件不存在: {obj_mesh_path}")
         return None
     obj_mesh = trimesh.load(obj_mesh_path)
     object_colors = obj_mesh.visual.vertex_colors
@@ -187,7 +189,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
                         for key in info 
                         if key not in ['batch_size','mano_params']})
     
-    print("right hand" if int(hand_info['is_right'].item()) else "left hand")
+    logging.info("right hand" if int(hand_info['is_right'].item()) else "left hand")
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     mano_params = hand_info["mano_params"]
@@ -223,7 +225,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
                             [0,1,0]], dtype=torch.float, requires_grad=False).to(obj_verts.device)
         
         obj_verts = obj_verts @ rot1.T
-        print("Done tripo trans")
+        logging.info("Done tripo trans")
     
     # process object mesh into sdf
     obj_mesh = trimesh.Trimesh(obj_verts.clone().cpu().numpy(), obj_faces)
@@ -249,7 +251,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
         np.save(obj_sdf_path, obj_sdf_voxel)
         
     if obj_sdf_voxel is None:
-        print("obj sdf is None: ", img_fn)
+        logging.error(f"【错误】obj sdf 为空: {img_fn}")
         return None
         
     obj_sdf = {"origin": torch.FloatTensor(obj_sdf_origin).cuda(),
@@ -281,6 +283,9 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
 
 @hydra.main(version_base=None, config_path="./configs", config_name="optim_teaser")
 def main(cfg : DictConfig) -> None:
+    # 初始化彩色日志
+    log_init()
+    
     exp_cfg = OmegaConf.create(cfg['experiments'])
     data_cfg = OmegaConf.create(cfg['data']) 
     if "is_tripo" in cfg:
@@ -305,13 +310,13 @@ def main(cfg : DictConfig) -> None:
         img_id_list = []
         hamer_info_list = []
         for file in os.listdir(data_cfg.input_dir):
-            print(file)
+            logging.info(file)
             if not file.endswith(("png", "jpg")):
                 continue
             img_id = file.split('.')[0]
             info = load_hamer_info(os.path.join(data_cfg.hand_dir, f"{img_id}.pt"))
             if info == None or len(info) == 0:
-                print("No Hamer Info!")
+                logging.warning("No Hamer Info!")
                 continue
             img_id_list.append(img_id)
             hamer_info_list.append(info)
@@ -336,11 +341,11 @@ def main(cfg : DictConfig) -> None:
         for item in hand_infos:
             data_item = load_data_single(data_cfg, file, item["id"], is_tripo)
             if data_item is None:
-                print("data_item is None")
+                logging.warning("data_item is None")
                 break
             hoi_sync.get_data(data_item)
-            hand_iou, o2h_dist = hoi_sync.get_hamer_hand_mask()
-            print(item["id"], "hand iou: ", hand_iou, "o2h_dist: ", o2h_dist)
+            hand_iou, o2h_dist = hoi_sync.get_hamer_hand_mask() # 计算 手和 hand_mask 一致性; 和 object_mask 的距离
+            logging.info(f"{item['id']} hand iou: {hand_iou}, o2h_dist: {o2h_dist}")
             if hand_iou is None or o2h_dist is None:
                 iou = None
             else:
@@ -352,14 +357,14 @@ def main(cfg : DictConfig) -> None:
             
         if hand_id is None:
             continue
-        
+        # 加载优化阶段的输入数据
         data_item = load_data_single(data_cfg, file, hand_id, is_tripo)
         if data_item is None:
             with open(lock_file, 'w') as f:
                 f.write("Failed to construct a SDF!")
             continue
         
-        print(data_item["name"])
+        logging.info(data_item["name"])
         
         with open(lock_file, 'w') as f:
             pass  # This creates an empty file
@@ -367,37 +372,37 @@ def main(cfg : DictConfig) -> None:
         
         hoi_sync.get_data(data_item)
         
-        print("get_hamer_hand_mask")
+        logging.info("get_hamer_hand_mask")
         hoi_sync.get_hamer_hand_mask()
         # hoi_sync.export_for_eval(prefix="before_camsetup")
         
         # stage 1: camera setup
         start_time = time.time()
-        print("optim_obj_cam start:", start_time)
+        logging.info(f"optim_obj_cam start: {start_time}")
         hoi_sync.optim_obj_cam()
         end_time = time.time()
-        print("optim_obj_cam end:", end_time)
-        print("optim_obj_cam takes: ", end_time - start_time)
+        logging.info(f"optim_obj_cam end: {end_time}")
+        logging.info(f"optim_obj_cam takes: {end_time - start_time}")
         hoi_sync.export(prefix="init")
         hoi_sync.export_for_eval(prefix="init")
         
         # Stage 2: contact alignment
         start_time = time.time()
-        print("contact alignment start:", start_time)
+        logging.info(f"contact alignment start: {start_time}")
         hoi_sync.run_handpose_global()
         end_time = time.time()
-        print("contact alignment end:", end_time)
-        print("contact alignment takes:", end_time - start_time)
+        logging.info(f"contact alignment end: {end_time}")
+        logging.info(f"contact alignment takes: {end_time - start_time}")
         hoi_sync.export(prefix="after_global")
         hoi_sync.export_for_eval(prefix="after_global")
         
         # Stage 3: hand refine
         start_time = time.time()
-        print("hand refine start:", start_time)
+        logging.info(f"hand refine start: {start_time}")
         hoi_sync.run_handpose_refine()
         end_time = time.time()
-        print("hand refine end:", end_time)
-        print("hand refine takes:", end_time - start_time)
+        logging.info(f"hand refine end: {end_time}")
+        logging.info(f"hand refine takes: {end_time - start_time}")
         
         hoi_sync.export(prefix="after")
         hoi_sync.export_for_eval(prefix="final")

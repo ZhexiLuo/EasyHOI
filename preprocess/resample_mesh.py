@@ -251,7 +251,7 @@ if __name__ == "__main__":
         load_tripo(folder)
         main(folder, False)
     
-    folder = os.path.join(args.data_dir, "obj_recon/results/instantmesh/instant-mesh-large/meshes/")
+    folder = os.path.join(args.data_dir, "obj_recon/results/tripo/meshes/")
     if args.resample:
         print("resample mesh using depth camera")
         main(folder, True)

@@ -32,7 +32,9 @@ conda activate base
 python preprocess/tripo3d_gen.py --data_dir $DATA_DIR
 END
 echo -e "\e[1;33;5m========== step6: 获取水密网络  ==========\e[0m"
-echo -e "\e[1;35;5m FIXME:暂时跳过步骤 \e[0m"
+echo -e "\e[1;35;5m get watertight mesh \e[0m"
+conda activate easyhoi
+python preprocess/resample_mesh.py --data_dir $DATA_DIR --resample
 
 echo -e "\e[1;33;5m========== stage2: Optimization!  ==========\e[0m"
 echo -e "\e[1;35;5m 三阶段优化 \e[0m"

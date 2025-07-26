@@ -3,7 +3,7 @@ defaults:
   - experiments: default
   - data: teaser_tripo
 
-log_dir: /home/zhexi/project/easyhoi/outputs
-out_dir: /home/zhexi/project/easyhoi/outputs/log
+log_dir: /home/zhexi/project/easyhoi/outputs/log
+out_dir: /home/zhexi/project/easyhoi/outputs
 is_tripo: True
 hand_scale: 5
