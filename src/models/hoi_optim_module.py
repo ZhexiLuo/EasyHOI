@@ -648,7 +648,7 @@ class HOI_Sync:
             
         return new_pose.detach()
     
-    def optim_handpose(self, pca_params, pca_params_orig, betas, mano_layer=None):
+    def optim_handpose(self, pca_params, pca_params_orig, betas, mano_layer=None, iteration=None, total_iterations=None):
         if mano_layer is None:
             mano_output: MANOOutput = self.mano_layer(pca_params, betas)
         else:
@@ -705,12 +705,16 @@ class HOI_Sync:
         loss_2d = self.loss_weights["loss_2d"] * loss_2d
         
         loss = (loss_3d +loss_2d +reg_loss)
-        self.log({
-                "contact": contact_loss, 
-                "penetr": penetr_loss,
-                "reg loss": reg_loss,
-                "2d loss": loss_2d,
-                "total loss": loss}, step=self.global_step)
+        
+        if iteration is not None and total_iterations is not None:
+            if iteration == 0 or iteration == total_iterations - 1:
+                self.log({
+                        "contact": contact_loss, 
+                        "penetr": penetr_loss,
+                        "reg loss": reg_loss,
+                        "2d loss": loss_2d,
+                        "total loss": loss}, step=self.global_step)
+        
         fullpose = mano_output.full_poses
         return loss, fullpose.detach(), pred_hand_mask.detach(), pred_obj_mask.detach()
     
@@ -805,10 +809,11 @@ class HOI_Sync:
         best_loss = float('inf')
         best_fullpose = None
         best_global_param = None
-        for iteration in range(outer_iteration * num_iterations):
+        total_iterations = outer_iteration * num_iterations
+        for iteration in range(total_iterations):
             self.optimizer.zero_grad()
             pcapose_new = pca_pose + fullpose_residual * fullpose_mask
-            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer)
+            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer, iteration=iteration, total_iterations=total_iterations)
                             
             loss.backward()
             self.optimizer.step()
@@ -866,10 +871,11 @@ class HOI_Sync:
         best_loss = float('inf')
         best_fullpose = None
         best_global_param = None
-        for iteration in range(outer_iteration * num_iterations):
+        total_iterations = outer_iteration * num_iterations
+        for iteration in range(total_iterations):
             self.optimizer.zero_grad()
             pcapose_new = pca_pose + fullpose_residual * fullpose_mask
-            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer)
+            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer, iteration=iteration, total_iterations=total_iterations)
                             
             loss.backward()
             self.optimizer.step()
