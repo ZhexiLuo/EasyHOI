@@ -131,7 +131,8 @@ def try_until_success(func, max_attempts=5, exception_to_check=Exception, verbos
             return result     # Return the result if successful
         except exception_to_check as e:
             if verbose:
-                logging.warning(f"Attempt {attempt} failed: {e}")
+                  logging.error(f"Attempt {attempt} failed, Exception Type: {repr(e)}")
+                  logging.error(f"可能是网络质量太差, 导致SDF相邻像素差距过大")
             if attempt < max_attempts:
                 if verbose:
                     logging.info("Retrying ...")
@@ -237,14 +238,24 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     obj_sdf_scale = 2.0 / np.max(obj_mesh.bounding_box.extents)
     
     obj_sdf_path = osp.join(cfg.obj_dir,img_fn, "sdf.npy")
+    
+    sdf_valid = False
+
     if os.path.exists(obj_sdf_path):
         obj_sdf_voxel = np.load(obj_sdf_path, allow_pickle=True)
-        if obj_sdf_voxel.size == 1 and obj_sdf_voxel.item() is None:
-            obj_sdf_voxel = None
-    else:
+        logging.info(f"从{obj_sdf_path}加载sdf")
+        if not (obj_sdf_voxel.size == 1 and obj_sdf_voxel.item() is None):
+            logging.info(f"sdf加载成功")
+            sdf_valid = True
+        else:
+            logging.warning(f"sdf加载失败, 重新计算")
+    
+
+    if not sdf_valid:
+        
         obj_sdf_voxel = try_until_success(
                                     mesh_to_voxels,
-                                    verbose=False,
+                                    verbose=True,
                                     mesh = obj_mesh,
                                     voxel_resolution=64, 
                                     check_result=True, 

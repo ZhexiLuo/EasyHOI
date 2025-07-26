@@ -150,7 +150,28 @@ class HOI_Sync:
         
     # 获取pipeline的输入数据, 通过data_item传入
     def get_data(self, data_item, **kwarg):
-        self.data = data_item
+        self.data = data_item   # 优化阶段的输入数据
+        """
+            ret = {
+            "name": img_fn,
+            "img_path": img_path,
+            "resolution":[h,w],
+            "image": np.array(input_image),
+            "hand_mask": torch.tensor(hand_mask == 0).cuda(), # the hand mask for inpaint has zero for hand region
+            "obj_mask": torch.tensor(obj_mask > 0).cuda(),
+            "inpaint_mask": torch.tensor(inpaint_mask > 0).cuda(),
+            "hand_cam": hand_cam,
+            "obj_cam": obj_cam,
+            "mano_params": mano_params,
+            "object_verts": obj_verts.unsqueeze(0),
+            "object_faces": torch.LongTensor(obj_mesh.faces).cuda(),
+            "object_colors": object_colors,
+            "object_sdf": obj_sdf,
+            "cam_transl": torch.tensor(hand_info["cam_transl"]).unsqueeze(0).float().cuda(),
+            "is_right": hand_info["is_right"],
+            "mesh_path": osp.join(cfg.obj_dir,img_fn, "fixed.obj")
+        }
+        """
         self.mano_params = data_item["mano_params"]
         
         self.hand_faces = self.mano_layer.get_mano_closed_faces().to(self.device)
@@ -838,6 +859,7 @@ class HOI_Sync:
             pred_hand_mask.save(osp.join(self.cfg.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
     
+    # step3解耦优化版本, 当前代码没使用
     def run_handpose_refine_disentangled(self, optim_type = "global", outer_iteration = 10):  
         """ Fix object pose, optimize hand pose"""
         # init param
