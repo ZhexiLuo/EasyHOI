@@ -23,6 +23,8 @@ from geomloss import SamplesLoss
 
 import rootutils
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+from src.utils.logging import log_init
+logging = log_init()
 # sys.path.append('third_party/hamer')
 
 from src.utils.losses import (
@@ -345,7 +347,7 @@ class HOI_Sync:
         
     
     def optim_obj_cam(self):
-        
+        # TODO:使用物体图像mask替代inpaint_mask
         gt_obj_mask = self.data["inpaint_mask"].float()
         # gt_obj_mask = self.data["obj_mask"].float()
         print(gt_obj_mask.shape)
@@ -387,6 +389,7 @@ class HOI_Sync:
         
         # c2ws_origin = c2ws.clone()
         c2ws_residual = torch.nn.Parameter(torch.zeros(6, device=device, dtype=c2ws.dtype))
+        logging.info(f"优化相机外参(旋转+平移), 相机内参(fx+fy)")
         opt = optimizer([projections_residual, c2ws_residual], lr=step_size)
         
         if params["loss"] == "l1":
@@ -409,10 +412,11 @@ class HOI_Sync:
             
         for i in range(self.cfg['obj_iteration']):
             projections = projections_origin + projections_residual * projections_mask
-            c2ws_r = c2ws_r_orig + c2ws_residual[:3] * 0.1 # control the step of rot
+            c2ws_r = c2ws_r_orig + c2ws_residual[:3] * 0.1 # NOTE:control the step of rot
             c2ws_t = c2ws_t_orig + c2ws_residual[3:]
             c2ws = geom_utils.axis_angle_t_to_matrix(c2ws_r, c2ws_t, c2ws_s_orig)
 
+            # 渲染物体 并获得mask
             img = self.renderer(verts, tri, color_obj, projections, c2ws, resolution=resolution)
             mask_opt = img[..., 1] # green channel
             
@@ -422,6 +426,7 @@ class HOI_Sync:
             # if not torch.any(mask_opt>0):
             #     return False
             
+            # 损失函数
             iou_loss = loss_func(mask_opt, gt_obj_mask)
             
             if iou_loss > 0.9:
@@ -446,7 +451,9 @@ class HOI_Sync:
         
         self.data["obj_cam"]["projection"] = projections.detach()
         self.data["obj_cam"]["extrinsics"] = c2ws.detach()[:3, :] # (3, 4)
+        logging.info(f"优化相机外参(旋转+平移), 相机内参(fx+fy)完成")
         # 深度剥离: 一个像素点对应多个物体表面
+        logging.info(f"计算接触点, 作为step2的输入")
         object_depth, object_rast = self.depth_peel(verts, tri, projections, c2ws, resolution,
                                             znear=0.1, zfar=100)  
         self.object_depth = object_depth.squeeze().detach() # [num_layers, H, W]
@@ -459,8 +466,12 @@ class HOI_Sync:
         
         hoi_mask = self.data["hamer_hand_mask"].bool() & self.data["inpaint_mask"]
         # 手遮挡物体
+        # 物体inpaint mask - 物体图像mask(被遮挡) = front mask
+        # TODO:能否把物体inpaint mask用物体渲染mask替代? 
+        # self.renderer获取物体渲染mask
         front_mask = (hoi_mask & self.data["inpaint_mask"] & (~self.data["obj_mask"])).int()
-        obj_pts_front, obj_contact_normals_front, contact_mask_front = compute_obj_contact(
+        # contact point 计算函数
+        obj_pts_front, obj_contact_normals_front, contact_mask_front = compute_obj_contact( 
             side='obj_front',
             mask=front_mask,
             verts=verts.squeeze(),
@@ -470,6 +481,7 @@ class HOI_Sync:
         )
         
         # 物体遮挡手
+        # 手部hamer重建mask - 手部图像mask(被遮挡) = bask mask
         back_mask = (hoi_mask & self.data["inpaint_mask"] & self.data["hamer_hand_mask"].bool() & (~self.data["hand_mask"])).int()
         obj_pts_back, obj_contact_normals_back, contact_mask_back = compute_obj_contact(
             side='obj_back',
@@ -703,6 +715,8 @@ class HOI_Sync:
         return loss, fullpose.detach(), pred_hand_mask.detach(), pred_obj_mask.detach()
     
     # 定义了2d损失和3d损失, 返回loss
+    # 2d 损失计算 渲染mask 和 图像mask 的距离
+    # 3d 损失用于手和物体接触点对齐, 并避免穿透
     def optim_handpose_global(self, fullpose, betas, scale=None, use_3d_loss = False):
         mano_output: MANOOutput = self.mano_layer(fullpose, betas)
         if scale is None:
@@ -760,6 +774,7 @@ class HOI_Sync:
                     }, step=self.global_step)
 
         return loss, pred_hand_mask, info, iou.item()
+    
     # stage3: 抓取姿势优化
     def run_handpose_refine(self, outer_iteration = 10):  
         """ Fix object pose, optimize hand pose"""
@@ -906,17 +921,16 @@ class HOI_Sync:
         _, init_hand_mask, init_info, iou = self.optim_handpose_global(fullpose, betas)
         
         for outer_iter in range(outer_iteration):    
-        # 接触损失和掩码损失交替优化
-        
-            # 基于梯度, 粗配准
+        # NOTE:循环内部交替 梯度优化 和 icp配准
             best_loss = float('inf')
             best_global_params = None
             best_fullpose = None
+            # 内循环:基于梯度, 粗配准
             for iteration in range(num_iterations):
                 self.optimizer.zero_grad()
                 fullpose_new = fullpose.clone()
                 fullpose_new[:,:3] += orient_res
-                # 优化T,R,scale
+                # NOTE:优化T,R,scale
                 loss, pred_hand_mask, _, _ = self.optim_handpose_global(fullpose_new, betas, 
                                                                         use_3d_loss=use_3d_loss)                     
                 
@@ -937,7 +951,7 @@ class HOI_Sync:
                 fullpose_new = best_fullpose
                 self.global_params['hand'] = best_global_params
                 hand_mesh, hand_verts, hand_contact, hand_c_normals = self.get_hand_contact(fullpose_new, betas.detach())
-                # 优化translation, R,scale固定
+                # NOTE:优化translation, R,scale固定
                 succ = self.optim_contact(hand_mesh, hand_verts, hand_contact, hand_c_normals) 
                 if succ == False:
                     use_3d_loss = True
@@ -1045,6 +1059,7 @@ class HOI_Sync:
         
         return hand_mesh_objcam, hand_verts_objcam, hand_contact, hand_contact_normal
     
+    # 接触优化, 只优化translation, 并且加入mask损失避免局部最优
     def optim_contact(self, hand_mesh, hand_verts, hand_contact, hand_contact_normal):
         obj_verts = self.transform_obj(**self.get_params_for('obj'))
         gt_hand_mask = self.data["hand_mask"].float()

@@ -154,7 +154,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     img_fn = file.split(".")[0]
     
     if not os.path.exists(osp.join(cfg.inpaint_dir, f"{img_fn}.png")):
-        logging.warning(f"inpaint image not exist: {osp.join(cfg.inpaint_dir, f'{img_fn}.png')}")
+        logging.error(f"inpaint image not exist: {osp.join(cfg.inpaint_dir, f'{img_fn}.png')}")
         return None
     
     
@@ -171,17 +171,19 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
     obj_mesh_path = osp.join(cfg.obj_dir,img_fn, "fixed.obj")
     
     if not os.path.exists(obj_mesh_path):
-        logging.error(f"【错误】obj 文件不存在: {obj_mesh_path}")
+        logging.error(f"{obj_mesh_path} 文件不存在, 跳过当前item")
         return None
     obj_mesh = trimesh.load(obj_mesh_path)
     object_colors = obj_mesh.visual.vertex_colors
     
     """ load hand info """
+    logging.info(f"加载手部MANO参数")
     info = torch.load(osp.join(cfg.hand_dir, f"{img_fn}.pt"))
     
     hand_info = {'mano_params': {}}
     for key in info['mano_params']:
         if hand_id >= info['mano_params'][key].shape[0]:
+            logging.error(f"手部MANO参数索引超出范围, 跳过当前item: {img_fn}")
             return None
         hand_info['mano_params'][key] = info['mano_params'][key][hand_id]
             
@@ -189,7 +191,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
                         for key in info 
                         if key not in ['batch_size','mano_params']})
     
-    logging.info("right hand" if int(hand_info['is_right'].item()) else "left hand")
+    logging.info("HAMER:当前item为右手" if int(hand_info['is_right'].item()) else "HAMER:当前item为左手")
     
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     mano_params = hand_info["mano_params"]
@@ -197,7 +199,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
         mano_params[key] = torch.tensor(mano_params[key]).to(device).unsqueeze(0)
         
     """Adjust the cam params"""
-    
+    logging.info("初始化相机参数")
     hand_cam = load_cam(hand_cam_file, device=device)
     hand_cam["projection"] = torch.tensor(get_projection(hand_cam, origin_w, origin_h)).float().to(device)
     
@@ -228,6 +230,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
         logging.info("Done tripo trans")
     
     # process object mesh into sdf
+    logging.info("处理物体网格为SDF")
     obj_mesh = trimesh.Trimesh(obj_verts.clone().cpu().numpy(), obj_faces)
         
     obj_sdf_origin = obj_mesh.bounding_box.centroid.copy()
@@ -251,7 +254,7 @@ def load_data_single(cfg: DictConfig, file, hand_id, is_tripo = False):
         np.save(obj_sdf_path, obj_sdf_voxel)
         
     if obj_sdf_voxel is None:
-        logging.error(f"【错误】obj sdf 为空: {img_fn}")
+        logging.error(f"obj sdf 为空, 跳过当前item: {img_fn}")
         return None
         
     obj_sdf = {"origin": torch.FloatTensor(obj_sdf_origin).cuda(),
@@ -358,13 +361,13 @@ def main(cfg : DictConfig) -> None:
         if hand_id is None:
             continue
         # 加载优化阶段的输入数据
-        data_item = load_data_single(data_cfg, file, hand_id, is_tripo)
+        data_item = load_data_single(data_cfg, file, hand_id, is_tripo) # 加载最匹配的id
         if data_item is None:
             with open(lock_file, 'w') as f:
                 f.write("Failed to construct a SDF!")
             continue
         
-        logging.info(data_item["name"])
+        logging.info(f"处理文件路径: {data_item['name']}")
         
         with open(lock_file, 'w') as f:
             pass  # This creates an empty file
@@ -372,39 +375,35 @@ def main(cfg : DictConfig) -> None:
         
         hoi_sync.get_data(data_item)
         
-        logging.info("get_hamer_hand_mask")
         hoi_sync.get_hamer_hand_mask()
         # hoi_sync.export_for_eval(prefix="before_camsetup")
         
         # stage 1: camera setup
+        logging.info("step1:优化相机参数")
         start_time = time.time()
-        logging.info(f"optim_obj_cam start: {start_time}")
         hoi_sync.optim_obj_cam()
         end_time = time.time()
-        logging.info(f"optim_obj_cam end: {end_time}")
-        logging.info(f"optim_obj_cam takes: {end_time - start_time}")
-        hoi_sync.export(prefix="init")
-        hoi_sync.export_for_eval(prefix="init")
+        logging.info(f"step1运行时间: {end_time - start_time}")
+        hoi_sync.export(prefix="camera_setup")
+        hoi_sync.export_for_eval(prefix="camera_setup")
         
         # Stage 2: contact alignment
+        logging.info("step2:手部接触对齐")
         start_time = time.time()
-        logging.info(f"contact alignment start: {start_time}")
         hoi_sync.run_handpose_global()
         end_time = time.time()
-        logging.info(f"contact alignment end: {end_time}")
-        logging.info(f"contact alignment takes: {end_time - start_time}")
-        hoi_sync.export(prefix="after_global")
-        hoi_sync.export_for_eval(prefix="after_global")
+        logging.info(f"step2运行时间: {end_time - start_time}")
+        hoi_sync.export(prefix="contact_alignment")
+        hoi_sync.export_for_eval(prefix="contact_alignment")
         
         # Stage 3: hand refine
+        logging.info("step3:手部细化")
         start_time = time.time()
-        logging.info(f"hand refine start: {start_time}")
         hoi_sync.run_handpose_refine()
         end_time = time.time()
-        logging.info(f"hand refine end: {end_time}")
-        logging.info(f"hand refine takes: {end_time - start_time}")
+        logging.info(f"step3运行时间: {end_time - start_time}")
         
-        hoi_sync.export(prefix="after")
+        hoi_sync.export(prefix="final")
         hoi_sync.export_for_eval(prefix="final")
         
         os.remove(lock_file)
