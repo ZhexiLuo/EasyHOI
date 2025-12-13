@@ -154,109 +154,124 @@ def transfer_vertex_colors(mesh_a, mesh_b):
 def meshfix(infile, outfile, origin_file=None):
     mesh = trimesh.load(infile)
     MAX_FACE_NUM = 50000
-    if mesh.faces.shape[0]>MAX_FACE_NUM:
-        simp_mesh = mesh.simplify_quadratic_decimation(MAX_FACE_NUM)
-        mesh = transfer_vertex_colors(mesh, simp_mesh)
-        mesh.export(infile)
     
-    tin = pymeshfix.PyTMesh()
-    tin.clean(max_iters=10, inner_loops=3)
-    meshfix = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
-    print("created")
-    try:
-        meshfix.repair()
-    except:
-        print("repair failed")
-    
-    print("repair finished")
-    
-    tin.load_array(meshfix.v, meshfix.f)
-    tin.fill_small_boundaries()
-    tin.clean(max_iters=10, inner_loops=3)
-    v, f = tin.return_arrays()
-    new_mesh = trimesh.Trimesh(v, f)
-    
-    if origin_file is not None:
-        mesh = trimesh.load(origin_file)
-    new_mesh = transfer_vertex_colors(mesh, new_mesh)
-    new_mesh.export(outfile)
-    print(new_mesh.is_watertight)
-    
-def load_tripo(folder):
-    for model in tqdm(os.listdir(folder)):
-        if model.startswith('.'):
-            continue
-        tripo_dir = os.path.join(folder, model, "tripo")
-        obj_files = glob.glob(os.path.join(tripo_dir, '*.obj'))
-        # print(obj_files)
-        
-        if len(obj_files) == 0:
-            print(model)
-            continue
-        mesh = trimesh.load(obj_files[0])
-        
-        if hasattr(mesh.visual, 'uv'):
-            vertex_colors = mesh.visual.to_color().vertex_colors
-            mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, vertex_colors=vertex_colors)
+    # Check if mesh simplification is needed
+    if mesh.faces.shape[0] > MAX_FACE_NUM:
+        print(f"Too many faces ({mesh.faces.shape[0]} > {MAX_FACE_NUM}), attempting simplification...")
+        try:
+            # Calculate target simplification ratio (between 0 and 1)
+            target_ratio = MAX_FACE_NUM / mesh.faces.shape[0]
+            target_ratio = max(0.1, min(0.9, target_ratio))  # Ensure ratio is within reasonable range
             
-        mesh.export(os.path.join(folder, model, "full.obj"))
-
-def main(folder, resample=False):
-    
-    # folder = '/storage/group/4dvlab/yumeng/RealDex_easyhoi/obj_recon/results/instantmesh/instant-mesh-large/meshes/'
-    for model in tqdm(os.listdir(folder)):
-        if model.startswith('.'):
-            continue
-        data_dir = os.path.join(folder, model)
-        out_path =os.path.join(data_dir, 'recon.ply') 
-        pc_path =os.path.join(data_dir, 'recon_pc.ply') 
-        fixed_path = os.path.join(data_dir, 'fixed.obj') 
-        
-        orig_mesh_path = os.path.join(data_dir, "full.obj")
-        
-        print(orig_mesh_path)
-        
-        
-        if os.path.exists(fixed_path):
-            continue
-        
-        if resample:
-            try:
-                point_clouds = generate_depth_images(orig_mesh_path)
-                mesh = poisson_reconstruct(point_clouds)
-                o3d.io.write_triangle_mesh(out_path, mesh)
-                o3d.io.write_point_cloud(pc_path, point_clouds)
-                meshfix(out_path, fixed_path, orig_mesh_path)
-            except:
-                print(orig_mesh_path, " MeshFix Wrong")
-        else:
-            try:
-                mesh:trimesh.Trimesh = trimesh.load(os.path.join(data_dir, "full.obj"))
+            print(f"Target simplification ratio: {target_ratio:.3f}")
+            simp_mesh = mesh.simplify_quadric_decimation(target_ratio)
+            
+            if simp_mesh.faces.shape[0] < mesh.faces.shape[0]:
+                mesh = transfer_vertex_colors(mesh, simp_mesh)
+                mesh.export(infile)
+                print(f"Mesh simplification successful, faces reduced from {mesh.faces.shape[0]} to {simp_mesh.faces.shape[0]}")
+            else:
+                print("Face count not reduced after simplification, using original mesh")
                 
-                meshfix(orig_mesh_path, fixed_path)
-            except:
-                print(orig_mesh_path, " MeshFix Wrong")
+        except ImportError as e:
+            print(f"Warning: Missing simplification dependency ({e}), skipping simplification step")
+            print(f"Suggestion: pip install fast-simplification")
+        except Exception as e:
+            print(f"Warning: Mesh simplification failed ({e}), continuing with original mesh")
+    
+    try:
+        tin = pymeshfix.PyTMesh()
+        tin.clean(max_iters=10, inner_loops=3)
+        meshfix_obj = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
+        print("MeshFix object created")
         
+        try:
+            meshfix_obj.repair()
+            print("Mesh repair completed")
+        except Exception as e:
+            print(f"Warning during repair process: {e}")
+        
+        tin.load_array(meshfix_obj.v, meshfix_obj.f)
+        tin.fill_small_boundaries()
+        tin.clean(max_iters=10, inner_loops=3)
+        v, f = tin.return_arrays()
+        new_mesh = trimesh.Trimesh(v, f)
+        
+        if origin_file is not None:
+            original_mesh = trimesh.load(origin_file)
+            new_mesh = transfer_vertex_colors(original_mesh, new_mesh)
+        
+        new_mesh.export(outfile)
+        print(f"Is mesh watertight: {new_mesh.is_watertight}")
+    except Exception as e:
+        print(f"MeshFix处理失败: {e}")
+        # 如果MeshFix失败，至少保存原始网格
+        mesh.export(outfile)
+        print("已保存原始网格作为备选输出")
+
+def load_tripo(file_path):
+    if not os.path.exists(file_path):
+        print(f"文件不存在: {file_path}")
+        return False
+    
+    mesh = trimesh.load(file_path)
+    
+    if hasattr(mesh.visual, 'uv'):
+        vertex_colors = mesh.visual.to_color().vertex_colors
+        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, vertex_colors=vertex_colors)
+    
+    output_dir = os.path.dirname(file_path)
+    output_path = os.path.join(output_dir, "full.obj")
+    mesh.export(output_path)
+    return True
+
+def main(file_path, resample=False):
+    if not os.path.exists(file_path):
+        print(f"文件不存在: {file_path}")
+        return
+    
+    data_dir = os.path.dirname(file_path)
+    out_path = os.path.join(data_dir, 'recon.ply') 
+    pc_path = os.path.join(data_dir, 'recon_pc.ply') 
+    fixed_path = os.path.join(data_dir, 'fixed.obj') 
+    
+    orig_mesh_path = os.path.join(data_dir, "full.obj")
+    
+    print(f"处理文件: {orig_mesh_path}")
+    
+    if os.path.exists(fixed_path):
+        print(f"输出文件已存在，跳过: {fixed_path}")
+        return
+    
+    if resample:
+        try:
+            point_clouds = generate_depth_images(orig_mesh_path)
+            mesh = poisson_reconstruct(point_clouds)
+            o3d.io.write_triangle_mesh(out_path, mesh)
+            o3d.io.write_point_cloud(pc_path, point_clouds)
+            meshfix(out_path, fixed_path, orig_mesh_path)
+        except Exception as e:
+            print(f"{orig_mesh_path} 网格修复失败: {e}")
+    else:
+        try:
+            mesh = trimesh.load(orig_mesh_path)
+            meshfix(orig_mesh_path, fixed_path)
+        except Exception as e:
+            print(f"{orig_mesh_path} 网格修复失败: {e}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Segementation.")
-    parser.add_argument('--data_dir', type=str, help='Path to the data to be processed')
+    parser.add_argument('--dir', type=str, help='Path to the data to be processed')
     parser.add_argument('--resample', action='store_true', help='Resample the point cloud using the depth camera')
     
     args = parser.parse_args()
     
-    folder = os.path.join(args.data_dir, "obj_recon/results/tripo/meshes/")
-    if os.path.exists(folder):
-        load_tripo(folder)
-        main(folder, False)
-    
-    folder = os.path.join(args.data_dir, "obj_recon/results/instantmesh/instant-mesh-large/meshes/")
-    if args.resample:
-        print("resample mesh using depth camera")
-        main(folder, True)
+    file = os.path.join(args.dir, "pc/scaled.obj")
+    if os.path.exists(file):
+        load_tripo(file)
+        main(file, False)
     else:
-        main(folder, False)
-        
+        print(f"输入文件不存在: {file}")
     
     

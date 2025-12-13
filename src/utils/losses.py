@@ -86,12 +86,13 @@ def find_closest_points_with_normals(source_points, target_points,
     
     return filt_src_pts, filt_src_norm, filt_dist, filt_idx
 
+# TODO: scale compute Bug!
 def icp_with_scale(src_points, src_norm,
                    tgt_points, tgt_norm,
                    fix_scale=False,
                    fix_R=False,
                    fix_t=False,
-                   max_iterations=200, tolerance=1e-4, device='cpu'):
+                   max_iterations=200, device='cpu'):
     """
     Performs ICP alignment with scale estimation using PyTorch.
 
@@ -122,6 +123,13 @@ def icp_with_scale(src_points, src_norm,
     t = torch.zeros((3,), device=device)
     scale = 1.0
 
+    # 跟踪历史最优结果
+    best_R = R.clone()
+    best_t = t.clone()
+    best_scale = scale
+    best_transformed_points = None
+    best_error = float('inf')
+    
     for _ in range(max_iterations):
         src_points, src_norm, distances, indices = find_closest_points_with_normals(
                 src_points, tgt_points, src_norm, tgt_norm
@@ -149,10 +157,16 @@ def icp_with_scale(src_points, src_norm,
         transformed_source_points = (R @ scaled_source_points.T).T + t
 
         mean_error = distances.mean()
-        if mean_error < tolerance:
-            break
+        
+        # 更新历史最优结果
+        if mean_error < best_error:
+            best_error = mean_error
+            best_R = R.clone()
+            best_t = t.clone()
+            best_scale = scale
+            best_transformed_points = transformed_source_points.clone()
 
-    return R, t, scale, transformed_source_points, mean_error
+    return best_R, best_t, best_scale, best_transformed_points, best_error
 
 def statistical_outlier_removal(points, k=20, z_score_threshold=0.5):
     """
@@ -216,7 +230,7 @@ def compute_h2o_sdf_loss(
     
     voxel = voxel[None, None, :, :, :] #[1, 1, D, H, W]  xyz
     voxel = voxel.expand([B,-1,-1,-1,-1]) #[V, 1, D, H, W]  xyz
-    query_grids = (hand_pts - origin) * scale # [V, 3]    
+    query_grids = (hand_pts - origin) * scale # [V, 3]  | 从世界坐标系转换到物体坐标系, 并缩放
     query_grids = query_grids[:, None, None, None, :] # [V, 1, 1, 1, 3]
     
     # xyz = query_grids.cpu().squeeze()

@@ -23,6 +23,8 @@ from geomloss import SamplesLoss
 
 import rootutils
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+from src.utils.logging import log_init
+logging = log_init()
 # sys.path.append('third_party/hamer')
 
 from src.utils.losses import (
@@ -47,7 +49,7 @@ from src.utils.losses import (
 from src.utils.cam_utils import verts_transfer_cam, center_looking_at_camera_pose, get_projection
 from src.utils.mesh_utils import render_mesh, pc_to_sphere_mesh
 from src.utils import geom_utils, hand_utils, image_utils
-
+from src.utils.utils import should_run_icp
 
 from manotorch.manolayer import ManoLayer, MANOOutput
 from manotorch.axislayer import AxisAdaptiveLayer, AxisLayerFK
@@ -58,16 +60,19 @@ import nvdiffrast.torch as dr
 
 ToPILImage = transforms.ToPILImage()
 
+# 核心类, 包含三阶段的手物对齐和优化
 class HOI_Sync:
-    def __init__(self, cfg:CfgNode, progress_bar):
+    def __init__(self, dir):
         super().__init__()
-        # Instantiate MANO model
-        self.cfg = cfg
-        mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
-        # self.mano = MANO(**mano_cfg).cuda()
-        self.tip_ids = [745, 317, 444, 556, 673]
-        # self.mano.eval()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        if self.device.type == 'cpu':
+            logging.error("CUDA not avilable, use CPU")
+        
+        """ Hyperparameters """
+        self.obj_iteration = 0  # stage1, 不需要optim
+        self.hand_refine_iteration = 100  # stage3
+        self.icp_fix_R = True  # 固定旋转
+        self.icp_fix_scale = True  # 固定尺度
         
         """ for optim """
         self.L1Loss = nn.L1Loss()
@@ -78,28 +83,42 @@ class HOI_Sync:
         self.anatomyLoss = AnatomyConstraintLossEE().to(self.device)
         self.anatomyLoss.setup()
         # self.chd_loss = ChamferDistance()
-        self.loss_weights = {k: float(v) for k, v in dict(cfg.weights).items()}
+        self.loss_weights = {
+            # step3优化损失
+            "contact": 5.0,
+            "penetr": 20.0,
+            "loss_2d": 1.0,
+            "regularize": 2.0,
+            # icp接触对齐损失
+            "error_3d": 10.0,  # 3D误差权重
+            "error_2d": 1.0,   # 2D误差权重
+        }
         self.param_dim = {'hand':[('scale',1), ('transl',3)],
                           'obj': [('scale',1), ('transl',3), ('orient',3)]}
-        if "hand_scale" not in cfg:
-            self.global_params = {
-                'hand': torch.FloatTensor([5, 0, 0, 0]).to(self.device),
-                'obj': torch.FloatTensor([1, 0,0,0, 0,0,0]).to(self.device),
-            }
-        else:
-            self.global_params = {
-                'hand': torch.FloatTensor([cfg.hand_scale, 0, 0, 0]).to(self.device),
-                'obj': torch.FloatTensor([1, 0,0,0, 0,0,0]).to(self.device),
-            }
-            
+        
+        """ global params"""
+        self.global_params = {
+            'hand': torch.FloatTensor([1, 0, 0, 0]).to(self.device),# NOTE: hand scale and transl
+            'obj': torch.FloatTensor([1, 0,0,0, 0,0,0]).to(self.device),
+        }
+        self.T = None
+        """
+        # init, include scale and transl
+        self.global_params['hand']
+        # from json
+        self.mano_params 
+        # fullpose
+        fullpose = torch.cat([self.mano_params["global_orient"], self.mano_params["hand_pose"]], dim=1)
+        self.mano_params['fullpose'] = matrix_to_axis_angle(fullpose).reshape(-1, 16*3) #[B, 16* 3]
+        # betas
+        self.mano_params['betas']
+        """
         
         for key in self.global_params:
             self.global_params[key].requires_grad_(True)
-        
+                
         """ for log """
         self.global_step = 0
-        self.progress_bar = progress_bar
-        
         """ for render """
         self.glctx = dr.RasterizeCudaContext()
         
@@ -107,12 +126,13 @@ class HOI_Sync:
         self.phi_center = None
         self.phi_range = None
         
+        
         """ for mano template """
         self.mano_layer = ManoLayer(side="right").to(self.device)
         with open("assets/mano_backface_ids.pkl", "rb") as f:
             self.hand_backface_ids = pickle.load(f)
             
-        contact_zone = np.load("assets/contact_zones.pkl", allow_pickle=True)['contact_zones']
+        contact_zone = np.load("assets/contact_zones.pkl", allow_pickle=True)['contact_zones']# 接触区域(掌心)
         self.hand_contact_zone = []
         for key in contact_zone:
             self.hand_contact_zone += contact_zone[key]
@@ -120,18 +140,19 @@ class HOI_Sync:
         
         """ for export """
         self.vis_mid_results = True
+        self.out_dir = osp.join(dir, "easyhoi")
         if self.vis_mid_results:
-            os.makedirs(osp.join(self.cfg.out_dir, "./midresult/test_hand_obj_cam"), exist_ok=True)
-            os.makedirs(osp.join(self.cfg.out_dir, "./midresult/test_obj_cam"), exist_ok=True)
-            os.makedirs(osp.join(self.cfg.out_dir, "./midresult/test_hand_cam"), exist_ok=True)
+            os.makedirs(osp.join(self.out_dir, "midresult", "test_hand_obj_cam"), exist_ok=True)
+            os.makedirs(osp.join(self.out_dir, "midresult", "test_obj_cam"), exist_ok=True)
+            os.makedirs(osp.join(self.out_dir, "midresult", "test_hand_cam"), exist_ok=True)
             
             
-        os.makedirs(self.cfg.out_dir, exist_ok=True)
-        os.makedirs(osp.join(self.cfg.out_dir, "render"), exist_ok=True)
-        os.makedirs(osp.join(self.cfg.out_dir, "eval"), exist_ok=True)
-        os.makedirs(osp.join(self.cfg.out_dir, "vis"), exist_ok=True)
-        os.makedirs(osp.join(self.cfg.out_dir, "retarget"), exist_ok=True)
-        os.makedirs(osp.join(self.cfg.out_dir, "contact"), exist_ok=True)
+        os.makedirs(self.out_dir, exist_ok=True)
+        os.makedirs(osp.join(self.out_dir, "render"), exist_ok=True)
+        os.makedirs(osp.join(self.out_dir, "eval"), exist_ok=True)
+        os.makedirs(osp.join(self.out_dir, "vis"), exist_ok=True)
+        os.makedirs(osp.join(self.out_dir, "retarget"), exist_ok=True)
+        os.makedirs(osp.join(self.out_dir, "contact"), exist_ok=True)
 
     
     def get_params_for(self, option):
@@ -144,8 +165,30 @@ class HOI_Sync:
             offset += dim
         return res
         
+    # 获取pipeline的输入数据, 通过data_item传入
     def get_data(self, data_item, **kwarg):
-        self.data = data_item
+        self.data = data_item   # 优化阶段的输入数据
+        """
+            ret = {
+            "name": img_fn,
+            "img_path": img_path,
+            "resolution":[h,w],
+            "image": np.array(input_image),
+            "hand_mask": torch.tensor(hand_mask == 0).cuda(), # the hand mask for inpaint has zero for hand region
+            "obj_mask": torch.tensor(obj_mask > 0).cuda(),
+            "inpaint_mask": torch.tensor(inpaint_mask > 0).cuda(),
+            "hand_cam": hand_cam,
+            "obj_cam": obj_cam,
+            "mano_params": mano_params,
+            "object_verts": obj_verts.unsqueeze(0),
+            "object_faces": torch.LongTensor(obj_mesh.faces).cuda(),
+            "object_colors": object_colors,
+            "object_sdf": obj_sdf,
+            "cam_transl": torch.tensor(hand_info["cam_transl"]).unsqueeze(0).float().cuda(),
+            "is_right": hand_info["is_right"],
+            "mesh_path": osp.join(cfg.obj_dir,img_fn, "fixed.obj")
+        }
+        """
         self.mano_params = data_item["mano_params"]
         
         self.hand_faces = self.mano_layer.get_mano_closed_faces().to(self.device)
@@ -163,8 +206,6 @@ class HOI_Sync:
                 output += f"{key}:{value_dict[key].item():.4e};"
             else:
                 output += f"{key}:0;"
-        self.progress_bar.set_description(output)
-        self.progress_bar.update(step)
     
     def get_mano_output(self):
         mano_params = self.mano_params
@@ -233,11 +274,11 @@ class HOI_Sync:
             
             mask = self.data["hamer_hand_mask"].cpu().numpy()
             mask = np.clip(np.rint(mask * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
-            Image.fromarray(mask).save(osp.join(self.cfg.out_dir, f"midresult/test_hand_cam/{name}_hamer.png"))
+            Image.fromarray(mask).save(osp.join(self.out_dir, f"midresult/test_hand_cam/{name}_hamer.png"))
             
             mask = self.data["hand_mask"].cpu().numpy()
             mask = np.clip(np.rint(mask * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
-            Image.fromarray(mask).save(osp.join(self.cfg.out_dir, f"midresult/test_hand_cam/{name}_seg.png"))
+            Image.fromarray(mask).save(osp.join(self.out_dir, f"midresult/test_hand_cam/{name}_seg.png"))
             
         return hand_iou.item(), o2h_dist.item()
             
@@ -340,9 +381,9 @@ class HOI_Sync:
             
         return c2ws
         
-    
+    # stage1: 优化相机位置
     def optim_obj_cam(self):
-        
+        # TODO:使用物体图像mask替代inpaint_mask
         gt_obj_mask = self.data["inpaint_mask"].float()
         # gt_obj_mask = self.data["obj_mask"].float()
         print(gt_obj_mask.shape)
@@ -355,7 +396,7 @@ class HOI_Sync:
             "optimizer": torch.optim.Adam, 
             "remesh": [50,100,150], 
         }
-        
+        # 物体mesh
         verts = self.data["object_verts"]
         tri = self.data["object_faces"].int()
         color_obj = torch.FloatTensor([0, 1, 0]).repeat(verts.shape[1], 1)
@@ -363,7 +404,6 @@ class HOI_Sync:
         
         step_size = params.get("step_size") # Step size
         optimizer = params.get("optimizer", torch.optim.Adam) # Which optimizer to use
-        
         
         projections = self.data["obj_cam"]["projection"]
         
@@ -374,7 +414,7 @@ class HOI_Sync:
         projections_origin = projections.clone()
         projections_residual = torch.nn.Parameter(torch.zeros((4, 4), device=device, dtype=projections_origin.dtype))
         # projections_residual = torch.nn.Parameter(torch.zeros((1), device=device, dtype=projections_origin.dtype))
-        projections_mask = torch.tensor([
+        projections_mask = torch.tensor([   # 相机内参mask, 只优化fx fy, 固定cx cy
                 [1., 0., 0., 0.], 
                 [0., 1., 0., 0.], 
                 [0., 0., 0., 0.], 
@@ -383,6 +423,7 @@ class HOI_Sync:
         
         # c2ws_origin = c2ws.clone()
         c2ws_residual = torch.nn.Parameter(torch.zeros(6, device=device, dtype=c2ws.dtype))
+        logging.info(f"优化相机外参(旋转+平移), 相机内参(fx+fy)")
         opt = optimizer([projections_residual, c2ws_residual], lr=step_size)
         
         if params["loss"] == "l1":
@@ -395,29 +436,32 @@ class HOI_Sync:
             loss_func = compute_sinkhorn_loss
             
             
-        print("obj_iteration: ", self.cfg['obj_iteration'])
-        
         c2ws_r_orig, c2ws_t_orig, c2ws_s_orig = geom_utils.matrix_to_axis_angle_t(c2ws)
         
         
         # c2ws = self.find_c2ws_init(verts, tri, color_obj, projections, resolution, gt_obj_mask)
         # c2ws_r_orig, c2ws_t_orig, c2ws_s_orig = geom_utils.matrix_to_axis_angle_t(c2ws)
-            
-        for i in range(self.cfg['obj_iteration']):
+        
+        logging.info(f"obj_iteration: {self.obj_iteration}")
+        with torch.no_grad():
+            img = self.renderer(verts, tri, color_obj, projections, c2ws, resolution=resolution)
+            mask_opt = img[..., 1]
+            mask_init = mask_opt.clone()
+
+        for i in range(self.obj_iteration):
             projections = projections_origin + projections_residual * projections_mask
-            c2ws_r = c2ws_r_orig + c2ws_residual[:3] * 0.1 # control the step of rot
+            c2ws_r = c2ws_r_orig + c2ws_residual[:3] * 0.1 # NOTE:control the step of rot
             c2ws_t = c2ws_t_orig + c2ws_residual[3:]
             c2ws = geom_utils.axis_angle_t_to_matrix(c2ws_r, c2ws_t, c2ws_s_orig)
 
+            # 渲染物体 并获得mask
             img = self.renderer(verts, tri, color_obj, projections, c2ws, resolution=resolution)
             mask_opt = img[..., 1] # green channel
             
-            if i==0:
-                mask_init = mask_opt.clone()
-                
             # if not torch.any(mask_opt>0):
             #     return False
             
+            # 损失函数
             iou_loss = loss_func(mask_opt, gt_obj_mask)
             
             if iou_loss > 0.9:
@@ -436,13 +480,15 @@ class HOI_Sync:
                 "total loss": loss
                 }, step=i
             )
-            
-            if loss.item() < 0.2:
+            if loss.item() < 0.01:
                 break
         
         self.data["obj_cam"]["projection"] = projections.detach()
         self.data["obj_cam"]["extrinsics"] = c2ws.detach()[:3, :] # (3, 4)
+        logging.info(f"优化相机外参(旋转+平移), 相机内参(fx+fy)完成")
         
+        # 深度剥离  一个像素点对应n个物体表面
+        logging.info(f"计算接触点, 作为step2的输入")
         object_depth, object_rast = self.depth_peel(verts, tri, projections, c2ws, resolution,
                                             znear=0.1, zfar=100)  
         self.object_depth = object_depth.squeeze().detach() # [num_layers, H, W]
@@ -452,10 +498,13 @@ class HOI_Sync:
                                    faces=tri.squeeze().cpu().numpy())
         normals = torch.tensor(obj_mesh.vertex_normals).float().to(self.device)
         
+        # TODO: 检查接触点是否合理
         
-        hoi_mask = self.data["hamer_hand_mask"].bool() & self.data["inpaint_mask"]
+        # 物体megapose重建mask - 物体图像mask(被遮挡) = front mask
+        hoi_mask = self.data["hamer_hand_mask"].bool() & self.data["inpaint_mask"].bool()
         front_mask = (hoi_mask & self.data["inpaint_mask"] & (~self.data["obj_mask"])).int()
-        obj_pts_front, obj_contact_normals_front, contact_mask_front = compute_obj_contact(
+        # 计算接触点
+        obj_pts_front, obj_contact_normals_front, contact_mask_front = compute_obj_contact( 
             side='obj_front',
             mask=front_mask,
             verts=verts.squeeze(),
@@ -464,7 +513,8 @@ class HOI_Sync:
             rast=self.object_rast
         )
         
-            
+        # 物体遮挡手
+        # 手部hamer重建mask - 手部图像mask(被遮挡) = bask mask
         back_mask = (hoi_mask & self.data["inpaint_mask"] & self.data["hamer_hand_mask"].bool() & (~self.data["hand_mask"])).int()
         obj_pts_back, obj_contact_normals_back, contact_mask_back = compute_obj_contact(
             side='obj_back',
@@ -481,10 +531,11 @@ class HOI_Sync:
         else:
             obj_pts = None
             obj_contact_normals = None
-            
+        # 接触点坐标
         self.obj_contact = {'front': obj_pts_front, 
                             'back': obj_pts_back,
                             'both': obj_pts}
+        # 接触点法向量
         self.obj_contact_normals = {'front': obj_contact_normals_front, 
                                     'back': obj_contact_normals_back,
                                     'both': obj_contact_normals}
@@ -494,22 +545,22 @@ class HOI_Sync:
             img_id = self.data["name"]
             depth = self.object_depth.unsqueeze(1) # [N, 1, H, W]
             image_utils.save_depth(depth, 
-                                fname=os.path.join(self.cfg.out_dir, f"midresult/test_obj_cam/{img_id}_depth"),
+                                fname=os.path.join(self.out_dir, f"midresult/test_obj_cam/{img_id}_depth"),
                                 text_list=["layer_0", "layer_1", "layer_2", "layer_3"],
                                 )
             
             mask = transforms.ToPILImage()(mask_opt)
-            mask.save(os.path.join(self.cfg.out_dir, f"midresult/test_obj_cam/{img_id}_optimized.png"))
+            mask.save(os.path.join(self.out_dir, f"midresult/test_obj_cam/{img_id}_optimized.png"))
             mask = transforms.ToPILImage()(mask_init)
-            mask.save(os.path.join(self.cfg.out_dir, f"midresult/test_obj_cam/{img_id}_init.png"))
+            mask.save(os.path.join(self.out_dir, f"midresult/test_obj_cam/{img_id}_init.png"))
             gt_obj_mask = transforms.ToPILImage()(gt_obj_mask)
-            gt_obj_mask.save(os.path.join(self.cfg.out_dir, f"midresult/test_obj_cam/{img_id}_gt.png"))
+            gt_obj_mask.save(os.path.join(self.out_dir, f"midresult/test_obj_cam/{img_id}_gt.png"))
             
             contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.cfg.out_dir, "contact", f"{img_id}_obj_mask_front.png"))
+            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_front.png"))
             
             contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.cfg.out_dir, "contact", f"{img_id}_obj_mask_back.png"))
+            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_back.png"))
             
             # output the object mesh with contact point
             verts = verts.squeeze().cpu().numpy()
@@ -532,7 +583,7 @@ class HOI_Sync:
             vertex_colors[len(verts):len(verts)+num_front, :] = [1.0, 0.0, 0.0, 1.0]  # Red
             vertex_colors[len(verts)+num_front:, :] = [0.0, 1.0, 0.0, 1.0]  # Green
             mesh.visual.vertex_colors = vertex_colors
-            mesh.export(os.path.join(self.cfg.out_dir, "contact", f"{img_id}_obj.ply"))
+            mesh.export(os.path.join(self.out_dir, "contact", f"{img_id}_obj.ply"))
             
         
     def depth_peel(self, verts, tri, projection, c2ws, resolution, num_layers=4, znear=0.1, zfar=100):
@@ -620,17 +671,17 @@ class HOI_Sync:
         new_pose = torch.concat([fullpose[:,:3], pca_params], dim=-1)
         
         if self.vis_mid_results:
-            os.makedirs(os.path.join(self.cfg.out_dir, "pca"), exist_ok=True)
+            os.makedirs(os.path.join(self.out_dir, "pca"), exist_ok=True)
             name = self.data['name']
             mesh = trimesh.Trimesh(pred_verts.detach().squeeze().cpu(), self.hand_faces.cpu())
-            mesh.export(os.path.join(self.cfg.out_dir, "pca" , f"{name}_pca_hand.ply"))
+            mesh.export(os.path.join(self.out_dir, "pca" , f"{name}_pca_hand.ply"))
             
             mesh = trimesh.Trimesh(gt_verts.detach().squeeze().cpu(), self.hand_faces.cpu())
-            mesh.export(os.path.join(self.cfg.out_dir, "pca" , f"{name}_gt_hand.ply"))
+            mesh.export(os.path.join(self.out_dir, "pca" , f"{name}_gt_hand.ply"))
             
         return new_pose.detach()
     
-    def optim_handpose(self, pca_params, pca_params_orig, betas, mano_layer=None):
+    def optim_handpose(self, pca_params, pca_params_orig, betas, mano_layer=None, iteration=None, total_iterations=None):
         if mano_layer is None:
             mano_output: MANOOutput = self.mano_layer(pca_params, betas)
         else:
@@ -687,12 +738,16 @@ class HOI_Sync:
         loss_2d = self.loss_weights["loss_2d"] * loss_2d
         
         loss = (loss_3d +loss_2d +reg_loss)
-        self.log({
-                "contact": contact_loss, 
-                "penetr": penetr_loss,
-                "reg loss": reg_loss,
-                "2d loss": loss_2d,
-                "total loss": loss}, step=self.global_step)
+        
+        if iteration is not None and total_iterations is not None:
+            if iteration == 0 or iteration == total_iterations - 1:
+                self.log({
+                        "contact": contact_loss, 
+                        "penetr": penetr_loss,
+                        "reg loss": reg_loss,
+                        "2d loss": loss_2d,
+                        "total loss": loss}, step=self.global_step)
+        
         fullpose = mano_output.full_poses
         return loss, fullpose.detach(), pred_hand_mask.detach(), pred_obj_mask.detach()
     
@@ -729,12 +784,17 @@ class HOI_Sync:
             iou = soft_iou_loss(pred_hand_mask, gt_hand_mask)
             
         if iou.item() >= 0.9:
+            if torch.sum(pred_hand_mask) == 0:
+                logging.error("Empty vector detected: pred_hand_mask is empty, rendered from current hand_verts")
+            if torch.sum(gt_hand_mask) == 0:
+                logging.error("Empty vector detected: gt_hand_mask is empty, rendered from initial MANO parameters of hamer model")
             sinkhorn_loss = compute_sinkhorn_loss(pred_hand_mask.contiguous(), gt_hand_mask.contiguous())
             loss_2d = sinkhorn_loss
         else:
             loss_2d = 10 * iou 
         
         if use_3d_loss:
+            # 3d损失包括: 接触损失, 穿透损失
             penetr_loss, contact_loss = compute_h2o_sdf_loss(self.data["object_sdf"], 
                                                 hand_verts,
                                                 self.hand_contact_zone)
@@ -753,6 +813,7 @@ class HOI_Sync:
 
         return loss, pred_hand_mask, info, iou.item()
     
+    # stage3: 抓取姿势优化
     def run_handpose_refine(self, outer_iteration = 10):  
         """ Fix object pose, optimize hand pose"""
         # init param
@@ -767,7 +828,7 @@ class HOI_Sync:
         fullpose_residual.requires_grad_()
         betas.requires_grad_()
         
-        params_group = [
+        params_group = [    # 优化的参数: 全局平移, 手部残差, 形状
             {'params': self.global_params['hand'], 'lr': 1e-2},
             {'params': fullpose_residual, 'lr': 1e-2},
             {'params': betas, 'lr': 1e-4},
@@ -776,16 +837,17 @@ class HOI_Sync:
         self.optimizer = optim.Adam(params_group)
         # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5) 
         
-        num_iterations = self.cfg['iteration']
+        num_iterations = self.hand_refine_iteration
         _, _, init_hand_mask, _ = self.optim_handpose(pca_pose, pca_pose, betas, hand_layer)
             
         best_loss = float('inf')
         best_fullpose = None
         best_global_param = None
-        for iteration in range(outer_iteration * num_iterations):
+        total_iterations = outer_iteration * num_iterations
+        for iteration in range(total_iterations):
             self.optimizer.zero_grad()
             pcapose_new = pca_pose + fullpose_residual * fullpose_mask
-            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer)
+            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer, iteration=iteration, total_iterations=total_iterations)
                             
             loss.backward()
             self.optimizer.step()
@@ -807,9 +869,10 @@ class HOI_Sync:
         if self.vis_mid_results:
             pred_hand_mask = pred_hand_mask.cpu()
             pred_hand_mask = ToPILImage(pred_hand_mask)
-            pred_hand_mask.save(osp.join(self.cfg.out_dir, 
+            pred_hand_mask.save(osp.join(self.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
     
+    # step3解耦优化版本, 当前代码没使用
     def run_handpose_refine_disentangled(self, optim_type = "global", outer_iteration = 10):  
         """ Fix object pose, optimize hand pose"""
         # init param
@@ -837,16 +900,17 @@ class HOI_Sync:
         self.optimizer = optim.Adam(params_group)
         # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5) 
         
-        num_iterations = self.cfg['iteration']
+        num_iterations = self.hand_refine_iteration
         _, _, init_hand_mask, _ = self.optim_handpose(pca_pose, pca_pose, betas, hand_layer)
             
         best_loss = float('inf')
         best_fullpose = None
         best_global_param = None
-        for iteration in range(outer_iteration * num_iterations):
+        total_iterations = outer_iteration * num_iterations
+        for iteration in range(total_iterations):
             self.optimizer.zero_grad()
             pcapose_new = pca_pose + fullpose_residual * fullpose_mask
-            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer)
+            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer, iteration=iteration, total_iterations=total_iterations)
                             
             loss.backward()
             self.optimizer.step()
@@ -868,10 +932,10 @@ class HOI_Sync:
         if self.vis_mid_results:
             pred_hand_mask = pred_hand_mask.cpu()
             pred_hand_mask = ToPILImage(pred_hand_mask)
-            pred_hand_mask.save(osp.join(self.cfg.out_dir, 
+            pred_hand_mask.save(osp.join(self.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
             
-                
+    # stage2优化: 手部全局平移
     def run_handpose_global(self):  
         """ Fix object pose, optimize hand pose"""
         # init param
@@ -883,52 +947,36 @@ class HOI_Sync:
         betas.requires_grad_()
         
         params_group = [
-            {'params': self.global_params['hand'], 'lr': 5e-2},
+            {'params': self.global_params['hand'], 'lr': 5e-2}, # 由scale和transl组成
             # {'params': betas, 'lr': 1e-4},
             {'params': orient_res, 'lr': 1e-5},
         ]
-        outer_iteration = 20
+        
         
         self.optimizer = optim.Adam(params_group)
         # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5) 
         
-        num_iterations = self.cfg['iteration']
+        num_iterations = self.hand_refine_iteration
         use_3d_loss = False
         
         _, init_hand_mask, init_info, iou = self.optim_handpose_global(fullpose, betas)
         
-        for outer_iter in range(outer_iteration):    
-            
-            best_loss = float('inf')
-            best_global_params = None
-            best_fullpose = None
-            for iteration in range(num_iterations):
-                self.optimizer.zero_grad()
-                fullpose_new = fullpose.clone()
-                fullpose_new[:,:3] += orient_res
-                loss, pred_hand_mask, _, _ = self.optim_handpose_global(fullpose_new, betas, 
-                                                                        use_3d_loss=use_3d_loss)                     
-                
-                loss.backward()
-                self.optimizer.step()
-                # self.scheduler.step()
-                self.global_step = iteration
-                
-                if loss.item() < best_loss:
-                    best_loss = loss.item()
-                    best_global_params = self.global_params['hand'].detach().clone()
-                    best_fullpose = fullpose.detach().clone()
-                    best_fullpose[:,:3] += orient_res
-                    
-            
-            if outer_iter < 2:
-                print("run icp")
-                fullpose_new = best_fullpose
-                self.global_params['hand'] = best_global_params
-                hand_mesh, hand_verts, hand_contact, hand_c_normals = self.get_hand_contact(fullpose_new, betas.detach())
-                succ = self.optim_contact(hand_mesh, hand_verts, hand_contact, hand_c_normals) # adjust the transl 
-                if succ == False:
-                    use_3d_loss = True
+        # 单次ICP配准, 直接使用初始fullpose
+        logging.warning("run single icp")
+        fullpose_new = fullpose.clone()
+        best_global_params = self.global_params['hand'].detach().clone()
+        best_fullpose = fullpose_new.detach().clone()
+        
+        hand_mesh, hand_verts, hand_contact, hand_c_normals = self.get_hand_contact(fullpose_new, betas.detach())
+        # NOTE:优化translation, R,scale固定
+        succ = self.optim_contact(hand_mesh, hand_verts, hand_contact, hand_c_normals) 
+        if succ == True:
+            best_global_params = self.global_params['hand'].detach().clone() # 更新平移
+        else:
+            logging.error("icp配准失败")
+        
+        loss, pred_hand_mask, _, _ = self.optim_handpose_global(fullpose_new, betas, 
+                                                                            use_3d_loss=True)
         
         self.mano_params['fullpose'] = best_fullpose
         self.global_params['hand'] = best_global_params
@@ -942,17 +990,17 @@ class HOI_Sync:
             # mask = np.clip(np.rint(mask * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
             pred_hand_mask = ToPILImage(pred_hand_mask)
             
-            pred_hand_mask.save(osp.join(self.cfg.out_dir, 
+            pred_hand_mask.save(osp.join(self.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim.png"))
             
             init_hand_mask = init_hand_mask.detach().cpu()
             init_hand_mask = ToPILImage(init_hand_mask)
-            init_hand_mask.save(osp.join(self.cfg.out_dir, 
+            init_hand_mask.save(osp.join(self.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_init.png"))
             
             gt_hand_mask = self.data["hamer_hand_mask"].cpu()
             gt_hand_mask = ToPILImage(gt_hand_mask.float())
-            gt_hand_mask.save(osp.join(self.cfg.out_dir, 
+            gt_hand_mask.save(osp.join(self.out_dir, 
                                         f"midresult/test_hand_obj_cam/{name}_gt.png"))
                 
             
@@ -1016,23 +1064,24 @@ class HOI_Sync:
         if self.vis_mid_results:
             name = self.data['name']
             contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.cfg.out_dir, "contact", f"{name}_hand_mask_front.png"))
+            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_front.png"))
             
             contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.cfg.out_dir, "contact", f"{name}_hand_mask_back.png"))
+            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_back.png"))
             
             image_utils.save_depth(hand_depth.detach(), 
-                                    os.path.join(self.cfg.out_dir, "contact", f"{name}_hand_depth"),
+                                    os.path.join(self.out_dir, "contact", f"{name}_hand_depth"),
                                     text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
             
             ids = torch.nonzero(contact_mask == 0)
             hand_depth[:, :, ids[:,0], ids[:,1]] = 0
             image_utils.save_depth(hand_depth.detach(), 
-                                    os.path.join(self.cfg.out_dir, "contact", f"{name}_filtered_hand_depth"),
+                                    os.path.join(self.out_dir, "contact", f"{name}_filtered_hand_depth"),
                                     text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
         
         return hand_mesh_objcam, hand_verts_objcam, hand_contact, hand_contact_normal
     
+    # 接触优化, 只优化translation, 并且加入mask损失避免局部最优
     def optim_contact(self, hand_mesh, hand_verts, hand_contact, hand_contact_normal):
         obj_verts = self.transform_obj(**self.get_params_for('obj'))
         gt_hand_mask = self.data["hand_mask"].float()
@@ -1041,7 +1090,9 @@ class HOI_Sync:
         best_t = None
         best_side = None
         trans_hand_pts = {}
+
         for side in ['front', 'back', 'both']:
+        # for side in ['both']:
             if self.obj_contact[side] is None:
                 continue
             if len(hand_contact[side]) == 0:
@@ -1050,28 +1101,31 @@ class HOI_Sync:
                 hand_contact[side] = hand_contact[side][self.hand_contact_zone]
                 hand_contact_normal[side] = hand_contact_normal[side][self.hand_contact_zone]
                 hand_contact_normal[side] = torch.Tensor(hand_contact_normal[side]).float().to(self.device)
-            R, t, scale, trans_hand_pts[side], error_3d = icp_with_scale(
+            R, t, scale, trans_hand_pts[side], error_3d = icp_with_scale(  # icp
                 src_points=hand_contact[side],
                 src_norm=-hand_contact_normal[side], # we hope the hand normal be opposite to object's
                 tgt_points=self.obj_contact[side],
                 tgt_norm=self.obj_contact_normals[side],
                 fix_R=True,
-                fix_scale=True,
+                fix_scale=self.icp_fix_scale,
                 device=self.device
             )
-            
-            after_hand_verts = (scale * hand_verts) @ R.T + t
-            # img = self.render_hand_image(hand_verts=after_hand_verts)
+            center = hand_verts.mean(dim=1, keepdim=True)
+            after_hand_verts = (scale * (hand_verts - center) + center) @ R.T + t
+
             img = self.render_hoi_image(after_hand_verts, self.hand_faces.squeeze(), 
                                 obj_verts, self.data["object_faces"].squeeze(),
                                 resolution=self.data["resolution"])
             pred_hand_mask = img[...,0]
-            error_2d = soft_iou_loss(pred_hand_mask, gt_hand_mask)
-            error = error_3d + error_2d
-            print(side, 'error: ', error.item(), 'error_2d: ', error_2d.item(), 'error_3d: ', error_3d.item())
+            error_2d = soft_iou_loss(pred_hand_mask, gt_hand_mask) # 交叉验证, 避免icp陷入局部最优
+            error = self.loss_weights["error_3d"] * error_3d + self.loss_weights["error_2d"] * error_2d
+            print(side, 'error: ', float(error), 'error_2d: ', float(error_2d), 'error_3d: ', float(error_3d))
             
             if error < min_error and not torch.isnan(t).any():
+                logging.info(f"stage2接触点icp配准:使用side: {side} 进行优化")
                 best_t = t
+                best_s = scale
+                best_R = R
                 best_side = side
                 min_error = error
         
@@ -1080,10 +1134,16 @@ class HOI_Sync:
         
         with torch.no_grad():
             self.global_params['hand'][1:] += best_t
-        
+            if not self.icp_fix_scale:
+                self.global_params['hand'][0] *= best_s
+                
         # after_hand_verts = (R @ (scale * hand_verts).T).T + t
-        after_hand_verts = (scale * hand_verts) @ R.T + best_t
         
+        if not self.icp_fix_scale:
+            center = hand_verts.mean(dim=1, keepdim=True)
+            after_hand_verts = (best_s * (hand_verts - center) + center) @ R.T + best_t
+        else:
+            after_hand_verts = hand_verts @ R.T + best_t
         
         name = self.data['name']
         # output the hand mesh with contact point
@@ -1098,7 +1158,7 @@ class HOI_Sync:
         vertex_colors[len(verts)+num_front:, :] = [0.0, 1.0, 0.0, 1.0]  # Green
         
         mesh.visual.vertex_colors = vertex_colors
-        mesh.export(os.path.join(self.cfg.out_dir, "contact", f"{name}_hand.ply"))
+        mesh.export(os.path.join(self.out_dir, "contact", f"{name}_hand.ply"))
         
         # output the transformed hand mesh with contact point
         trans_hand_pts = trans_hand_pts[best_side]
@@ -1117,7 +1177,7 @@ class HOI_Sync:
             vertex_colors[len(verts):, :] = [0.0, 0.0, 1.0, 1.0]  # Blue
         if vertex_colors.size > 0:
             mesh.visual.vertex_colors = vertex_colors
-            mesh.export(os.path.join(self.cfg.out_dir, "contact", f"{name}_hand_after.ply"))
+            mesh.export(os.path.join(self.out_dir, "contact", f"{name}_hand_after.ply"))
             
         return True
         
@@ -1150,7 +1210,7 @@ class HOI_Sync:
     
     def get_hand_for_objcam(self, hand_verts, scale, transl):    
         hand_verts = self.get_hand_for_handcam(hand_verts, scale, transl, need_hamer_process=True)
-        hand_verts = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])
+        hand_verts, T = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])
         return hand_verts
     
     def get_hand_for_handcam(self, hand_verts, scale, transl, need_hamer_process=True):
@@ -1164,28 +1224,31 @@ class HOI_Sync:
         
         return hand_verts
     
+    # 求(hand从初始加载到obj_cam坐标系下的旋转)的逆, only rotation, no translation
     def get_hand_global_rot(self):
-        hamer_rot = torch.tensor([[[1,0,0],
-                            [0,-1,0],
-                            [0,0,-1]]], dtype=torch.float, requires_grad=False).to(self.device)
+        hamer_rot = torch.tensor([[[1,0,0], # 坐标系矫正
+                                 [0,-1,0],
+                                 [0,0,-1]]], dtype=torch.float, requires_grad=False).to(self.device)
         
         src_cam_ext = self.data["hand_cam"]["extrinsics"]
         tgt_cam_ext = self.data["obj_cam"]["extrinsics"]
-        cam_rot = tgt_cam_ext[None, :3, :3] @ src_cam_ext[None, :3,:3].mT
+        cam_rot = tgt_cam_ext[None, :3, :3] @ src_cam_ext[None, :3,:3].mT   
         
         return cam_rot @ hamer_rot
-        
+    
     
     def get_hand_verts(self, hand_verts, scale, transl):
         # hand_verts = self.hamer_process(hand_verts)
         # hand_verts = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])
         hand_verts[:,:,0] = (2*self.data["is_right"]-1)*hand_verts[:,:,0]
+        hand_verts = self.hamer_process(hand_verts) # 绕x旋转180
         
+        _, self.T = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])#hand_cam -> obj_cam
+        hand_verts = hand_verts @ (scale * self.T[:3, :3].mT) + (self.T[:3, 3] * scale + transl)
+        """
         global_rot = self.get_hand_global_rot()
         hand_verts = hand_verts @ global_rot.mT
-        hand_verts = hand_verts * scale
-        hand_verts = hand_verts + transl
-        
+        """
         return hand_verts
         
     
@@ -1211,215 +1274,49 @@ class HOI_Sync:
         return obj_mesh
         
     
-    def vis_hand_object(output, data, image, save_dir):
-        hHand = output['hHand']
-        hObj = output['hObj']
-        device = hObj.device
 
-        cam_f, cam_p = data['cam_f'], data['cam_p']
-        cTh = data['cTh']
-
-        hHand.textures = mesh_utils.pad_texture(hHand, 'blue')
-        hHoi = mesh_utils.join_scene([hObj, hHand]).to(device)
-        cHoi = mesh_utils.apply_transform(hHoi, cTh.to(device))
-        cameras = PerspectiveCameras(cam_f, cam_p, device=device)
-        iHoi = mesh_utils.render_mesh(cHoi, cameras,)
-        image_utils.save_images(iHoi['image'], save_dir + '_cHoi', bg=data['image']/2+0.5, mask=iHoi['mask'])
-        image_utils.save_images(data['image']/2+0.5, save_dir + '_inp')
-
-        image_list = mesh_utils.render_geom_rot(cHoi, cameras=cameras, view_centric=True)
-        image_utils.save_gif(image_list, save_dir + '_cHoi')
-
-        mesh_utils.dump_meshes([save_dir + '_hoi'], hHoi)
-    
-    def export_for_sim(self):
-        name = self.data['name']
+    def export_mano(self, prefix=None):
         
-        out_path = osp.join(self.cfg.out_dir, "sim")
-        os.makedirs(out_path, exist_ok=True)
-        
-        mano_output = self.get_mano_output()
-        
-        hand_verts = self.get_hand_verts(mano_output.verts, **self.get_params_for('hand'))
-        
-        
-        obj_verts = self.transform_obj(**self.get_params_for('obj'), need_hamer_process=False)
-        
-        res = {"mano":mano_output, "hand": self.get_params_for('hand'), "obj": self.get_params_for('obj') }
-        torch.save(res, os.path.join(out_path, f"{name}.pt"))
-        
-        # export meshes
-        hand_verts = hand_verts.squeeze().detach().cpu().numpy()
-        hand_mesh = trimesh.Trimesh(vertices=hand_verts, faces=self.hand_faces.squeeze().cpu())
-        obj_mesh = trimesh.Trimesh(vertices=obj_verts.detach().squeeze().cpu(),
-                                   faces=self.data["object_faces"].squeeze().cpu(),
-                                   vertex_colors=self.data["object_colors"])
-        
-        
-        hand_mesh.export(os.path.join(out_path, f"{name}_hand.ply"))
-        obj_mesh.export(os.path.join(out_path, f"{name}_obj.ply"))
-        
-    def export_for_eval(self, prefix=None):
-        
-        if prefix is not None:
-            os.makedirs(osp.join(self.cfg.out_dir, "eval"+ "_" + prefix), exist_ok=True)
-            foldername = "eval"+ "_" +prefix
-        else:
-            foldername = "eval"
+        output_dir = osp.join(self.out_dir, "export_" + prefix)
+        os.makedirs(output_dir, exist_ok=True)
             
-        global_mat = self.get_hand_global_rot()
-        
-        objVerts = self.transform_obj(**self.get_params_for('obj'), need_hamer_process=False)
-        
-        objVerts = objVerts @ global_mat # global_mat^-1 @ objVerts
-        scaled_objVerts = objVerts/self.global_params['hand'][0] # scale
-        
-        obj_mesh = trimesh.Trimesh(vertices=scaled_objVerts.detach().squeeze().cpu(),
-                                   faces=self.data["object_faces"].squeeze().cpu(),
-                                   vertex_colors=self.data["object_colors"])
-        
-        mano_params = self.mano_params
-        fullpose = mano_params['fullpose']
-        
-        transl = self.global_params['hand'][1:] / self.global_params['hand'][0]
-        transl = torch.matmul(global_mat.mT , transl)
-        
-        rot = fullpose[:,:3]
-        rot, transl = hand_utils.cvt_axisang_t_i2o(rot, transl)
-        
-        objRot = torch.zeros_like(transl)
-        objTrans = torch.zeros_like(transl)
-        
-        wTh = geom_utils.axis_angle_t_to_matrix(rot, transl)
-        wTo = geom_utils.axis_angle_t_to_matrix(objRot, objTrans)
-        hTo = geom_utils.inverse_rt(mat=wTh, return_mat=True) @ wTo
-        
-        hA = mano_params['fullpose'][:, 3:]
-        
-        data = {'wTh': wTh,
-                'hTo': hTo, 
-                'obj_mesh': obj_mesh, 
-                'hA': hA,
-                }
-        
-        hand_rot = self.get_hand_global_rot()
-        mano_params = {key: mano_params[key].cpu() for key in mano_params}
-        cam_data = {
-            "name": self.data["name"],
-            "img_path": self.data["img_path"],
-            "is_right": self.data["is_right"],
-            "cam_projection" : self.data["obj_cam"]["projection"].cpu(),
-            "cam_extrinsics" : self.data["obj_cam"]["extrinsics"].cpu(),
-            "mano_params": mano_params,
-            "hand_scale": self.global_params['hand'][0].cpu(),
-            "hand_transl": self.global_params['hand'][1:].cpu(),
-            "hand_rot": hand_rot.squeeze().cpu()
-        }
-        torch.save(data, osp.join(self.cfg.out_dir, foldername, f"{self.data['name']}.pkl"))
-        torch.save(cam_data, osp.join(self.cfg.out_dir, foldername, f"{self.data['name']}_hand_in_objcam.pkl"))
-        
-    
-    def export_for_retarget(self):
-        global_mat = self.get_hand_global_rot()
-        
-        objVerts = self.transform_obj(**self.get_params_for('obj'), need_hamer_process=False)
-        objVerts = objVerts @ global_mat # global_mat^-1 @ objVerts
-        objVerts /= self.global_params['hand'][0] # scale
-        
-        obj_mesh = trimesh.Trimesh(vertices=objVerts.detach().squeeze().cpu(),
-                                   faces=self.data["object_faces"].squeeze().cpu(),
-                                   vertex_colors=self.data["object_colors"])
-        
-        mano_params = self.mano_params
-        fullpose = mano_params['fullpose']
-        
-        transl = self.global_params['hand'][1:] / self.global_params['hand'][0]
-        transl = torch.matmul(global_mat.mT , transl)
-        
-        data = {
-            'is_right': self.data["is_right"],
-            'global_orient': fullpose[:,:3].detach().cpu(),
-            'transl': transl.detach().cpu(),
-            'fullpose': fullpose[:,3:].detach().cpu(),
-            'beta': mano_params['betas'].detach().cpu() 
-        }
-        for key in data:
-            print(key, ": ", data[key].shape)
-        torch.save(data, osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}.pt"))
-        obj_mesh.export(osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}_obj.ply"))
-        
-        # fullpose = torch.concat([global_orient, fullpose[:, 3:]], dim=1)
-        betas = mano_params['betas']
-        mano_output: MANOOutput = self.mano_layer(fullpose, betas)
-        hand_verts = mano_output.verts
-        hand_verts[:,:,0] = (2*self.data["is_right"]-1)*hand_verts[:,:,0]
-        hand_verts = hand_verts + transl
-        hand_mesh = trimesh.Trimesh(vertices=hand_verts.squeeze().detach().cpu().numpy(), 
-                                    faces=self.hand_faces.squeeze().cpu())
-        hand_mesh.export(osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}_hand.ply"))
-    
-    def export_for_retarget_new(self):
-        global_mat = self.get_hand_global_rot()
-        
-        objVerts = self.transform_obj(**self.get_params_for('obj'), need_hamer_process=False)
-        objVerts = objVerts @ global_mat # global_mat^-1 @ objVerts
-        objVerts /= self.global_params['hand'][0] # scale
-        objVerts[:,:,0] = (2*self.data["is_right"]-1)*objVerts[:,:,0]
-        objFaces = self.data["object_faces"].squeeze().cpu()
-        if not self.data["is_right"]:
-            objFaces = objFaces[:,[0,2,1]] # faces for left hand
-        
+        # TODO:export mano params
         mano_params = self.mano_params
         fullpose = mano_params['fullpose']
         betas = mano_params['betas']
-        rotation_center = self.mano_layer.get_rotation_center(betas)
-        rotation_center[0] =  (2*self.data["is_right"]-1)*rotation_center[0]
-        global_orient = fullpose[:,:3]
-        transl = self.global_params['hand'][1:] / self.global_params['hand'][0]
-        transl = torch.matmul(global_mat.mT , transl)
+        cam_transl = self.data["cam_transl"]
+        is_right = self.data["is_right"]
+        T = self.T
+        hand_params = self.get_params_for('hand')
+        cam_extrinsics = self.data["obj_cam"]["extrinsics"]
+        cam_projection = self.data["obj_cam"]["projection"]
+        # export json file
+        def tensor_to_list(t):
+            if hasattr(t, 'detach'):
+                return t.detach().cpu().numpy().tolist()
+            elif isinstance(t, np.ndarray):
+                return t.tolist()
+            elif hasattr(t, 'item'):  # numpy scalar
+                return t.item()
+            else:
+                return t
         
-        objVerts -= transl
-        objVerts -= rotation_center
-        obj_mesh = trimesh.Trimesh(vertices=objVerts.detach().squeeze().cpu(),
-                                   faces=objFaces,
-                                   vertex_colors=self.data["object_colors"])
-        obj_transform = geom_utils.axis_angle_t_to_matrix(global_orient).squeeze().detach().cpu()
-        obj_mesh.apply_transform(np.linalg.inv(obj_transform))
-        obj_mesh.apply_translation((rotation_center).squeeze().detach().cpu().numpy())
-        obj_mesh.export(osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}_obj.ply"))
+        ret = {}
+        ret['fullpose'] = tensor_to_list(fullpose)
+        ret['betas'] = tensor_to_list(betas)
+        ret['cam_transl'] = tensor_to_list(cam_transl)
+        ret['is_right'] = tensor_to_list(is_right)
+        ret['T'] = tensor_to_list(T)
+        ret['cam_extrinsics'] = tensor_to_list(cam_extrinsics)
+        ret['cam_projection'] = tensor_to_list(cam_projection)
         
+        serializable_hand_params = {}
+        for k, v in hand_params.items():
+            serializable_hand_params[k] = tensor_to_list(v)
+        ret['hand_params'] = serializable_hand_params
         
-        fullpose[:, :3] *=0
-        transl *= 0
-        
-        data = {
-            'is_right': self.data["is_right"],
-            'global_orient': fullpose[:,:3].detach().cpu(),
-            'transl': transl.detach().cpu(),
-            'fullpose': fullpose[:,3:].detach().cpu(),
-            'beta': mano_params['betas'].detach().cpu() 
-        }
-        for key in data:
-            print(key, ": ", data[key].shape)
-        torch.save(data, osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}.pt"))
-        
-        
-        
-        # fullpose = torch.concat([global_orient, fullpose[:, 3:]], dim=1)
-        betas = mano_params['betas']
-        mano_output: MANOOutput = self.mano_layer(fullpose, betas)
-        hand_verts = mano_output.verts
-        # hand_verts[:,:,0] = (2*self.data["is_right"]-1)*hand_verts[:,:,0]
-        hand_verts = hand_verts + transl
-        if not self.data["is_right"]:
-            hand_faces = self.hand_faces[:,[0,2,1]] # faces for left hand
-        else:
-            hand_faces = self.hand_faces
-        hand_mesh = trimesh.Trimesh(vertices=hand_verts.squeeze().detach().cpu().numpy(), 
-                                    faces=hand_faces.squeeze().cpu())
-        hand_mesh.export(osp.join(self.cfg.out_dir, "retarget", f"{self.data['name']}_hand.ply"))
-        
-        
+        with open(osp.join(output_dir, f"res.json"), 'w') as f:
+            json.dump(ret, f, indent=4)
     
     def export(self, prefix=None):
         mano_output = self.get_mano_output()
@@ -1439,7 +1336,7 @@ class HOI_Sync:
         img = img.detach().cpu().numpy() 
         img = np.clip(np.rint(img * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
         image = Image.fromarray(img)
-        image.save(osp.join(self.cfg.out_dir, "render", f"{filename}.png"))
+        image.save(osp.join(self.out_dir, "render", f"{filename}.png"))
         
         
         # export meshes
@@ -1450,12 +1347,13 @@ class HOI_Sync:
                                    vertex_colors=self.data["object_colors"])
         # obj_mesh = self.transform_obj_origin(self.data["mesh_path"], **self.get_params_for('obj'))
         mesh = mesh+obj_mesh
-        path = osp.join(self.cfg.out_dir, f"{filename}.ply")
+        path = osp.join(self.out_dir, f"{filename}.ply")
         mesh.export(path)
         
         
+            
     def exam_mask(self, pred:torch.Tensor, gt:torch.Tensor, prefix:str):
-        out_dir = osp.join(self.cfg.out_dir, "render_exam")
+        out_dir = osp.join(self.out_dir, "render_exam")
         os.makedirs(out_dir, exist_ok=True)
         pred = pred.detach().cpu().numpy()
         gt = gt.cpu().numpy()
@@ -1471,3 +1369,22 @@ class HOI_Sync:
         
         
 
+def to_serializable(obj):
+    if isinstance(obj, dict):
+        return {k: to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, torch.Tensor):
+        return to_serializable(obj.detach().cpu().numpy())
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64, np.int16, np.uint8, np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, trimesh.Trimesh):
+        return {
+            "vertices": to_serializable(obj.vertices),
+            "faces": to_serializable(obj.faces),
+            "vertex_colors": to_serializable(obj.visual.vertex_colors) if hasattr(obj.visual, 'vertex_colors') else None
+        }
+    else:
+        return obj

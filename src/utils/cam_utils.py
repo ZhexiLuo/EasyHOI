@@ -13,19 +13,44 @@ def batched_cam(cam, batch_size):
     cam_int = cam_int.unsqueeze(0).expand(batch_size,-1,-1)
     return cam_ext, cam_int
     
-
+# 若相机参考系变化, 为保持相机视角下物体一致, 计算new_verts
 def verts_transfer_cam(src_verts:torch.Tensor, 
                        src_cam:Dict[str, torch.Tensor], 
                        tgt_cam:Dict[str, torch.Tensor]):
     """
     src_verts: torch.Tensor [batch_size, V, 3]
     """
-    B,_,_ = src_verts.shape
-    src_cam_ext = src_cam["extrinsics"].unsqueeze(0).expand(B,-1,-1)
-    tgt_cam_ext = tgt_cam["extrinsics"].unsqueeze(0).expand(B,-1,-1)
+    B, V, _ = src_verts.shape
+    device = src_verts.device
+    dtype = src_verts.dtype
+    
+    # 相机外参是c2w(camera to world), verts是行向量
+    src_cam_ext = src_cam["extrinsics"].unsqueeze(0).expand(B, -1, -1)
+    tgt_cam_ext = tgt_cam["extrinsics"].unsqueeze(0).expand(B, -1, -1)
+    """
+    # step1, 物体相对于src_cam的坐标(也是相对于tgt_cam的坐标)
     new_verts = (src_verts - src_cam_ext[:,:,-1]) @ src_cam_ext[:,:,:3]
-    new_verts = new_verts @ tgt_cam_ext[:, :, :3].mT + tgt_cam_ext[:, :,-1] 
-    return new_verts
+    # step2, 相对坐标->新的世界坐标
+    new_verts = new_verts @ tgt_cam_ext[:, :, :3].mT + tgt_cam_ext[:, :,-1]
+    """
+        
+    A = tgt_cam_ext[:, :, :3] @ src_cam_ext[:, :, :3].transpose(-1, -2)
+    b = -torch.einsum('bi,bij->bj', src_cam_ext[:, :, 3], A) + tgt_cam_ext[:, :, 3]
+
+    # Build the homogeneous transformation matrix T for column vectors (v' = T @ v)
+    T = torch.zeros((B, 4, 4), device=device, dtype=dtype)
+    T[:, :3, :3] = A
+    T[:, :3, 3] = b
+    T[:, 3, 3] = 1
+
+    # Convert src_verts to homogeneous coordinates (row vectors)
+    src_verts = F.pad(src_verts, (0, 1), 'constant', 1.0)
+    
+    # Apply transformation. Since verts are row vectors, we use v' = v @ T_transpose
+    new_verts = src_verts @ T.transpose(-1, -2)
+    new_verts = new_verts[:, :, :3]
+
+    return new_verts, T[0]
 
 def project_hand_2D(verts:torch.Tensor, cam:Dict[str, torch.Tensor]):
     B,_,_ = verts.shape
@@ -41,6 +66,13 @@ def load_cam(file_path, device):
         cam = json.load(json_file)
 
     cam['extrinsics'] = torch.tensor(cam['extrinsics']).to(device)
+    """
+    cam['extrinsics'] = torch.tensor([
+        [1.0,  0.0,  0.0, 0.0],
+        [0.0, -1.0,  0.0, 0.0],
+        [0.0,  0.0, -1.0, 0.0]
+    ], device=device)
+    """
     cam['intrinsic'] = torch.tensor([[cam['fx'], 0, cam['cx']],
                                      [0, cam['fy'], cam['cy']],
                                      [0, 0, 1]]).to(device)

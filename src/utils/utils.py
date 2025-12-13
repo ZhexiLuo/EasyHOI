@@ -122,3 +122,46 @@ def get_metric_value(metric_dict: Dict[str, Any], metric_name: Optional[str]) ->
     log.info(f"Retrieved metric value! <{metric_name}={metric_value}>")
 
     return metric_value
+
+
+def should_run_icp(current_iter: int, icp_iters_range) -> bool:
+    """
+    判断当前迭代轮次是否应该运行ICP配准。
+    
+    支持两种配置格式：
+    1. 单区间格式：[start, end] - 在[start, end)区间内运行ICP
+    2. 多区间格式：[[start1, end1], [start2, end2], ...] - 在多个区间内运行ICP
+    
+    Args:
+        current_iter (int): 当前迭代轮次
+        icp_iters_range: ICP配准的轮次配置
+            - 单区间：[start, end] 
+            - 多区间：[[start1, end1], [start2, end2], ...]
+    
+    Returns:
+        bool: 如果当前轮次应该运行ICP则返回True，否则返回False
+    
+    Examples:
+        >>> # 单区间配置
+        >>> should_run_icp(1, [0, 5])  # True (1 在 [0,5) 内)
+        >>> should_run_icp(5, [0, 5])  # False (5 不在 [0,5) 内)
+        
+        >>> # 多区间配置  
+        >>> should_run_icp(1, [[0, 2], [5, 8]])   # True (1 在 [0,2) 内)
+        >>> should_run_icp(3, [[0, 2], [5, 8]])   # False (3 不在任何区间内)
+        >>> should_run_icp(6, [[0, 2], [5, 8]])   # True (6 在 [5,8) 内)
+    """
+    if not icp_iters_range:
+        return False
+    
+    # 检查是否为多区间格式
+    if isinstance(icp_iters_range[0], (list, tuple)):
+        # 多区间格式 [[start1, end1], [start2, end2], ...]
+        for start, end in icp_iters_range:
+            if start <= current_iter < end:
+                return True
+        return False
+    else:
+        # 单区间格式 [start, end] (向后兼容)
+        start, end = icp_iters_range
+        return start <= current_iter < end
