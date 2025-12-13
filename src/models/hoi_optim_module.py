@@ -4,6 +4,7 @@ import pickle
 import json
 import os
 import os.path as osp
+from pathlib import Path
 import sys
 import time
 from PIL import Image
@@ -62,11 +63,23 @@ ToPILImage = transforms.ToPILImage()
 
 # 核心类, 包含三阶段的手物对齐和优化
 class HOI_Sync:
-    def __init__(self, dir):
+    def __init__(self, dir, project_root=None):
         super().__init__()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         if self.device.type == 'cpu':
             logging.error("CUDA not avilable, use CPU")
+            
+        if project_root is None:
+             raise ValueError("project_root must be provided")
+             
+        # Build paths internally based on project_root
+        project_root_path = Path(project_root)
+        
+        easyhoi_assets_root = str(project_root_path / "thirdparty" / "EasyHOI" / "assets")
+        
+        # MANO assets: .../Project_refactoring/checkpoints/hamer/_DATA/data/mano
+        mano_assets_root = str(project_root_path / "checkpoints" / "hamer" / "_DATA" / "data" / "mano")
+        self.mano_assets_root = mano_assets_root
         
         """ Hyperparameters """
         self.obj_iteration = 0  # stage1, 不需要optim
@@ -78,8 +91,8 @@ class HOI_Sync:
         self.L1Loss = nn.L1Loss()
         self.bce_loss = nn.BCELoss()
         self.sinkhorn_loss = SamplesLoss('sinkhorn')
-        self.axisFK = AxisLayerFK(mano_assets_root="assets/mano").to(self.device)
-        self.anchor_layer = AnchorLayer(anchor_root="assets/anchor").to(self.device)
+        self.axisFK = AxisLayerFK(mano_assets_root=mano_assets_root).to(self.device)
+        self.anchor_layer = AnchorLayer(anchor_root=osp.join(easyhoi_assets_root, "anchor")).to(self.device)
         self.anatomyLoss = AnatomyConstraintLossEE().to(self.device)
         self.anatomyLoss.setup()
         # self.chd_loss = ChamferDistance()
@@ -128,11 +141,11 @@ class HOI_Sync:
         
         
         """ for mano template """
-        self.mano_layer = ManoLayer(side="right").to(self.device)
-        with open("assets/mano_backface_ids.pkl", "rb") as f:
+        self.mano_layer = ManoLayer(side="right", mano_assets_root=mano_assets_root).to(self.device)
+        with open(osp.join(easyhoi_assets_root, "mano_backface_ids.pkl"), "rb") as f:
             self.hand_backface_ids = pickle.load(f)
             
-        contact_zone = np.load("assets/contact_zones.pkl", allow_pickle=True)['contact_zones']# 接触区域(掌心)
+        contact_zone = np.load(osp.join(easyhoi_assets_root, "contact_zones.pkl"), allow_pickle=True)['contact_zones']# 接触区域(掌心)
         self.hand_contact_zone = []
         for key in contact_zone:
             self.hand_contact_zone += contact_zone[key]
@@ -495,7 +508,8 @@ class HOI_Sync:
         self.object_rast = object_rast.squeeze().detach() # [num_layers, H, W, 4]
         
         obj_mesh = trimesh.Trimesh(vertices=verts.squeeze().cpu().numpy(), 
-                                   faces=tri.squeeze().cpu().numpy())
+                                   faces=tri.squeeze().cpu().numpy(),
+                                   process=False)
         normals = torch.tensor(obj_mesh.vertex_normals).float().to(self.device)
         
         # TODO: 检查接触点是否合理
@@ -819,7 +833,7 @@ class HOI_Sync:
         # init param
         fullpose:torch.Tensor = self.mano_params['fullpose'].detach().clone()
         betas:torch.Tensor = self.mano_params['betas'].clone()
-        hand_layer = ManoLayer(use_pca=True, ncomps=10).to(self.device)
+        hand_layer = ManoLayer(use_pca=True, ncomps=10, mano_assets_root=self.mano_assets_root).to(self.device)
         
         pca_pose = self.optimize_pca(fullpose, betas, hand_layer)
         fullpose_residual = torch.nn.Parameter(torch.zeros_like(pca_pose))
@@ -878,7 +892,7 @@ class HOI_Sync:
         # init param
         fullpose:torch.Tensor = self.mano_params['fullpose'].detach().clone()
         betas:torch.Tensor = self.mano_params['betas'].clone()
-        hand_layer = ManoLayer(use_pca=True, ncomps=10).to(self.device)
+        hand_layer = ManoLayer(use_pca=True, ncomps=10, mano_assets_root=self.mano_assets_root).to(self.device)
         
         pca_pose = self.optimize_pca(fullpose, betas, hand_layer)
         fullpose_residual = torch.nn.Parameter(torch.zeros_like(pca_pose))
