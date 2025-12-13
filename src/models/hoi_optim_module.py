@@ -26,7 +26,7 @@ import rootutils
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from src.utils.logging import log_init
 logging = log_init()
-# sys.path.append('third_party/hamer')
+
 
 from src.utils.losses import (
     compute_obj_contact_loss, 
