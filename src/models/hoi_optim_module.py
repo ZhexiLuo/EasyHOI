@@ -337,63 +337,6 @@ class HOI_Sync:
         return img
         
     
-    def uniform_sample_objcam(self, center=None, phi_range=None, n_phi=10):
-        # param from instantmesh
-        DEFAULT_DIST = 4.5
-        
-        if center is None:
-            center = torch.pi/2
-        if phi_range is None:
-            phi_range = torch.pi/6
-        
-        phi = torch.linspace(center - phi_range/2, center + phi_range/2, n_phi, 
-                            device=self.device, dtype=torch.float32)
-        theta = torch.FloatTensor([0]).to(self.device)
-        theta = torch.linspace( -phi_range, phi_range, n_phi, 
-                            device=self.device, dtype=torch.float32)
-        
-        x = torch.sin(phi) * torch.cos(theta)
-        y = torch.sin(phi) * torch.sin(theta)
-        z = torch.cos(phi)
-        
-        directions = torch.stack((x, y, z), dim=1)
-        cam_pose = DEFAULT_DIST * directions
-        
-        c2ws = center_looking_at_camera_pose(cam_pose)
-        return c2ws, phi, phi_range
-    
-    def find_c2ws_init(self, verts, tri, color_obj, projections, resolution, gt_obj_mask, max_depth=3):
-        phi_center = self.phi_center
-        phi_range = self.phi_range
-        for depth in range(max_depth):
-            c2ws_list, phi_list, phi_range = self.uniform_sample_objcam(phi_center, phi_range, n_phi=10)
-            min_metric = torch.inf
-            best_id = 0
-            # gt_obj_mask = gt_obj_mask.cpu().numpy().astype(bool)
-            
-            for i in range(c2ws_list.shape[0]):
-                c2ws = c2ws_list[i]
-                img = self.renderer(verts, tri, color_obj, projections, c2ws, resolution=resolution)
-                mask_opt = img[..., 1] # green channel
-                if mask_opt.sum() > 0:
-                    with torch.no_grad():
-                        metric = compute_sinkhorn_loss(mask_opt, gt_obj_mask)
-                else:
-                    metric = torch.inf
-                
-                if metric < min_metric:
-                    best_id = i
-                    min_metric = metric
-            print("best_id: ", best_id, "phi: ", phi_list[best_id])
-            c2ws = c2ws_list[best_id]
-            phi_center = phi_list[best_id]
-            phi_range = phi_range / 2
-            
-        self.phi_center = phi_center
-        # self.phi_range = phi_range
-            
-        return c2ws
-        
     # stage1: 优化相机位置
     def optim_obj_cam(self):
         # TODO:使用物体图像mask替代inpaint_mask
@@ -886,69 +829,6 @@ class HOI_Sync:
             pred_hand_mask.save(osp.join(self.out_dir, 
                                             f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
     
-    # step3解耦优化版本, 当前代码没使用
-    def run_handpose_refine_disentangled(self, optim_type = "global", outer_iteration = 10):  
-        """ Fix object pose, optimize hand pose"""
-        # init param
-        fullpose:torch.Tensor = self.mano_params['fullpose'].detach().clone()
-        betas:torch.Tensor = self.mano_params['betas'].clone()
-        hand_layer = ManoLayer(use_pca=True, ncomps=10, mano_assets_root=self.mano_assets_root).to(self.device)
-        
-        pca_pose = self.optimize_pca(fullpose, betas, hand_layer)
-        fullpose_residual = torch.nn.Parameter(torch.zeros_like(pca_pose))
-        fullpose_mask = torch.ones_like(pca_pose)
-        fullpose_mask[:, :3] = 0
-        fullpose_residual.requires_grad_()
-        betas.requires_grad_()
-        
-        if optim_type == "global":
-            params_group = [
-                {'params': self.global_params['hand'], 'lr': 1e-2},
-            ]
-        elif optim_type == "artic":
-            params_group = [
-                {'params': fullpose_residual, 'lr': 1e-2},
-                {'params': betas, 'lr': 1e-4},
-            ]
-        
-        self.optimizer = optim.Adam(params_group)
-        # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=200, gamma=0.5) 
-        
-        num_iterations = self.hand_refine_iteration
-        _, _, init_hand_mask, _ = self.optim_handpose(pca_pose, pca_pose, betas, hand_layer)
-            
-        best_loss = float('inf')
-        best_fullpose = None
-        best_global_param = None
-        total_iterations = outer_iteration * num_iterations
-        for iteration in range(total_iterations):
-            self.optimizer.zero_grad()
-            pcapose_new = pca_pose + fullpose_residual * fullpose_mask
-            loss, fullpose_new, pred_hand_mask, pred_obj_mask = self.optim_handpose(pcapose_new, pca_pose, betas, hand_layer, iteration=iteration, total_iterations=total_iterations)
-                            
-            loss.backward()
-            self.optimizer.step()
-            # self.scheduler.step()
-            self.global_step = iteration
-            
-            if loss.item() < best_loss:
-                best_loss = loss.item()
-                best_fullpose = fullpose_new.detach().clone()
-                best_global_param = self.global_params['hand'].detach().clone()
-
-        self.mano_params['fullpose'] = best_fullpose.detach()
-        self.mano_params['betas'] = betas.detach()
-        self.global_params['hand'] = best_global_param
-        
-        name = self.data['name']
-        
-        # vis for check, can be commented
-        if self.vis_mid_results:
-            pred_hand_mask = pred_hand_mask.cpu()
-            pred_hand_mask = ToPILImage(pred_hand_mask)
-            pred_hand_mask.save(osp.join(self.out_dir, 
-                                            f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
-            
     # stage2优化: 手部全局平移
     def run_handpose_global(self):  
         """ Fix object pose, optimize hand pose"""
@@ -1207,26 +1087,6 @@ class HOI_Sync:
         vertices = vertices @ rot.mT
         return vertices
     
-    def get_cTw(self):
-        rot = torch.tensor([[1,0,0],
-                            [0,-1,0],
-                            [0,0,-1]], dtype=torch.float, requires_grad=False)
-        transl = self.data["cam_transl"].cpu().squeeze()
-        cTw = torch.eye(4)
-        cTw[:3, :3] = rot
-        cTw[:3, -1] = rot @ transl
-        # cTw[:3, -1] = transl
-        
-        # cTw = torch.inverse(cTw)
-        
-        return cTw
-        
-    
-    def get_hand_for_objcam(self, hand_verts, scale, transl):    
-        hand_verts = self.get_hand_for_handcam(hand_verts, scale, transl, need_hamer_process=True)
-        hand_verts, T = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])
-        return hand_verts
-    
     def get_hand_for_handcam(self, hand_verts, scale, transl, need_hamer_process=True):
         hand_verts = hand_verts * scale
         hand_verts = hand_verts + transl
@@ -1238,19 +1098,6 @@ class HOI_Sync:
         
         return hand_verts
     
-    # 求(hand从初始加载到obj_cam坐标系下的旋转)的逆, only rotation, no translation
-    def get_hand_global_rot(self):
-        hamer_rot = torch.tensor([[[1,0,0], # 坐标系矫正
-                                 [0,-1,0],
-                                 [0,0,-1]]], dtype=torch.float, requires_grad=False).to(self.device)
-        
-        src_cam_ext = self.data["hand_cam"]["extrinsics"]
-        tgt_cam_ext = self.data["obj_cam"]["extrinsics"]
-        cam_rot = tgt_cam_ext[None, :3, :3] @ src_cam_ext[None, :3,:3].mT   
-        
-        return cam_rot @ hamer_rot
-    
-    
     def get_hand_verts(self, hand_verts, scale, transl):
         # hand_verts = self.hamer_process(hand_verts)
         # hand_verts = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])
@@ -1259,10 +1106,6 @@ class HOI_Sync:
         
         _, self.T = verts_transfer_cam(hand_verts, self.data["hand_cam"], self.data["obj_cam"])#hand_cam -> obj_cam
         hand_verts = hand_verts @ (scale * self.T[:3, :3].mT) + (self.T[:3, 3] * scale + transl)
-        """
-        global_rot = self.get_hand_global_rot()
-        hand_verts = hand_verts @ global_rot.mT
-        """
         return hand_verts
         
     
@@ -1273,20 +1116,6 @@ class HOI_Sync:
         obj_verts = self.data["object_verts"]
         
         return obj_verts
-    
-    def transform_obj_origin(self, obj_path, scale, transl, orient, need_hamer_process=True):
-        obj_mesh = trimesh.load(obj_path)
-        obj_verts = torch.from_numpy(obj_mesh.vertices).to(self.device).unsqueeze(0)
-        
-        rot_mat = axis_angle_to_matrix(orient)
-        obj_verts = scale * self.data["object_verts"]@rot_mat.T + transl
-        
-        if need_hamer_process is True:
-            obj_verts = self.hamer_process(obj_verts)
-        obj_mesh.vertices = obj_verts.squeeze().detach().cpu().numpy()
-        
-        return obj_mesh
-        
     
 
     def export_mano(self, prefix=None):
@@ -1366,39 +1195,3 @@ class HOI_Sync:
         
         
             
-    def exam_mask(self, pred:torch.Tensor, gt:torch.Tensor, prefix:str):
-        out_dir = osp.join(self.out_dir, "render_exam")
-        os.makedirs(out_dir, exist_ok=True)
-        pred = pred.detach().cpu().numpy()
-        gt = gt.cpu().numpy()
-        
-        cmap = plt.get_cmap('viridis')
-        pred = (cmap(pred)[:,:,:3] * 255).astype(np.uint8)
-        gt = (cmap(gt)[:,:,:3]*255).astype(np.uint8)
-        
-        pred_img = Image.fromarray(pred).convert('RGB')  #grayscale
-        gt_img = Image.fromarray(gt).convert('RGB') 
-        pred_img.save(osp.join(out_dir, f"{prefix}_pred.png"))
-        gt_img.save(osp.join(out_dir, f"{prefix}_gt.png"))
-        
-        
-
-def to_serializable(obj):
-    if isinstance(obj, dict):
-        return {k: to_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, torch.Tensor):
-        return to_serializable(obj.detach().cpu().numpy())
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.float32, np.float64, np.float16)):
-        return float(obj)
-    elif isinstance(obj, (np.int32, np.int64, np.int16, np.uint8, np.uint16, np.uint32, np.uint64)):
-        return int(obj)
-    elif isinstance(obj, trimesh.Trimesh):
-        return {
-            "vertices": to_serializable(obj.vertices),
-            "faces": to_serializable(obj.faces),
-            "vertex_colors": to_serializable(obj.visual.vertex_colors) if hasattr(obj.visual, 'vertex_colors') else None
-        }
-    else:
-        return obj
