@@ -12,8 +12,7 @@ def batched_cam(cam, batch_size):
     cam_ext = cam_ext.unsqueeze(0).expand(batch_size,-1,-1)
     cam_int = cam_int.unsqueeze(0).expand(batch_size,-1,-1)
     return cam_ext, cam_int
-    
-# 若相机参考系变化, 为保持相机视角下物体一致, 计算new_verts
+
 def verts_transfer_cam(src_verts:torch.Tensor, 
                        src_cam:Dict[str, torch.Tensor], 
                        tgt_cam:Dict[str, torch.Tensor]):
@@ -23,16 +22,9 @@ def verts_transfer_cam(src_verts:torch.Tensor,
     B, V, _ = src_verts.shape
     device = src_verts.device
     dtype = src_verts.dtype
-    
-    # 相机外参是c2w(camera to world), verts是行向量
+
     src_cam_ext = src_cam["extrinsics"].unsqueeze(0).expand(B, -1, -1)
     tgt_cam_ext = tgt_cam["extrinsics"].unsqueeze(0).expand(B, -1, -1)
-    """
-    # step1, 物体相对于src_cam的坐标(也是相对于tgt_cam的坐标)
-    new_verts = (src_verts - src_cam_ext[:,:,-1]) @ src_cam_ext[:,:,:3]
-    # step2, 相对坐标->新的世界坐标
-    new_verts = new_verts @ tgt_cam_ext[:, :, :3].mT + tgt_cam_ext[:, :,-1]
-    """
         
     A = tgt_cam_ext[:, :, :3] @ src_cam_ext[:, :, :3].transpose(-1, -2)
     b = -torch.einsum('bi,bij->bj', src_cam_ext[:, :, 3], A) + tgt_cam_ext[:, :, 3]

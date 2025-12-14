@@ -123,7 +123,6 @@ def icp_with_scale(src_points, src_norm,
     t = torch.zeros((3,), device=device)
     scale = 1.0
 
-    # 跟踪历史最优结果
     best_R = R.clone()
     best_t = t.clone()
     best_scale = scale
@@ -158,7 +157,6 @@ def icp_with_scale(src_points, src_norm,
 
         mean_error = distances.mean()
         
-        # 更新历史最优结果
         if mean_error < best_error:
             best_error = mean_error
             best_R = R.clone()
