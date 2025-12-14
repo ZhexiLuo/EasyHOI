@@ -116,14 +116,7 @@ class HOI_Sync:
             self.hand_contact_zone.extend(zone_indices)
     
     def _setup_output_directories(self) -> None:
-        self.vis_mid_results = True
-        subdirs = ["render", "eval", "vis", "retarget", "contact"]
-        if self.vis_mid_results:
-            subdirs.extend([
-                "midresult/test_hand_obj_cam",
-                "midresult/test_obj_cam",
-                "midresult/test_hand_cam",
-            ])
+        subdirs = ["render", "contact"]
         self.out_dir.mkdir(parents=True, exist_ok=True)
         for subdir in subdirs:
             (self.out_dir / subdir).mkdir(parents=True, exist_ok=True)
@@ -219,17 +212,6 @@ class HOI_Sync:
         o2h_dist = compute_nonzero_distance_2d(self.data["hamer_hand_mask"], 
                                               self.data["inpaint_mask"])
         
-        if self.vis_mid_results:
-            name = self.data['name']
-            
-            mask = self.data["hamer_hand_mask"].cpu().numpy()
-            mask = np.clip(np.rint(mask * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
-            Image.fromarray(mask).save(osp.join(self.out_dir, f"midresult/test_hand_cam/{name}_hamer.png"))
-            
-            mask = self.data["hand_mask"].cpu().numpy()
-            mask = np.clip(np.rint(mask * 255), 0, 255).astype(np.uint8) # Quantize to np.uint8
-            Image.fromarray(mask).save(osp.join(self.out_dir, f"midresult/test_hand_cam/{name}_seg.png"))
-            
         return hand_iou.item(), o2h_dist.item()
             
     
@@ -332,35 +314,30 @@ class HOI_Sync:
                                     'back': obj_contact_normals_back,
                                     'both': obj_contact_normals}
         
-        if self.vis_mid_results:
-            img_id = self.data["name"]
-            depth = self.object_depth.unsqueeze(1)
-            image_utils.save_depth(depth, 
-                                fname=os.path.join(self.out_dir, f"midresult/test_obj_cam/{img_id}_depth"),
-                                text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
-            
-            contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_front.png"))
-            contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_back.png"))
-            
-            verts_np = verts.squeeze().cpu().numpy()
-            if obj_pts_front is not None:
-                front_spheres = pc_to_sphere_mesh(obj_pts_front.cpu().numpy())
-                num_front = front_spheres.vertices.shape[0]
-                mesh = obj_mesh + front_spheres
-            else:
-                num_front = 0
-                mesh = obj_mesh
-            if obj_pts_back is not None:
-                back_spheres = pc_to_sphere_mesh(obj_pts_back.cpu().numpy())
-                mesh = mesh + back_spheres
+        # save contact outputs
+        img_id = self.data["name"]
+        contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
+        contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_front.png"))
+        contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
+        contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{img_id}_obj_mask_back.png"))
+        
+        verts_np = verts.squeeze().cpu().numpy()
+        if obj_pts_front is not None:
+            front_spheres = pc_to_sphere_mesh(obj_pts_front.cpu().numpy())
+            num_front = front_spheres.vertices.shape[0]
+            mesh = obj_mesh + front_spheres
+        else:
+            num_front = 0
+            mesh = obj_mesh
+        if obj_pts_back is not None:
+            back_spheres = pc_to_sphere_mesh(obj_pts_back.cpu().numpy())
+            mesh = mesh + back_spheres
 
-            vertex_colors = np.ones((len(mesh.vertices), 4))
-            vertex_colors[len(verts_np):len(verts_np)+num_front, :] = [1.0, 0.0, 0.0, 1.0]  # Red: front
-            vertex_colors[len(verts_np)+num_front:, :] = [0.0, 1.0, 0.0, 1.0]  # Green: back
-            mesh.visual.vertex_colors = vertex_colors
-            mesh.export(os.path.join(self.out_dir, "contact", f"{img_id}_obj.ply"))
+        vertex_colors = np.ones((len(mesh.vertices), 4))
+        vertex_colors[len(verts_np):len(verts_np)+num_front, :] = [1.0, 0.0, 0.0, 1.0]  # Red: front
+        vertex_colors[len(verts_np)+num_front:, :] = [0.0, 1.0, 0.0, 1.0]  # Green: back
+        mesh.visual.vertex_colors = vertex_colors
+        mesh.export(os.path.join(self.out_dir, "contact", f"{img_id}_obj.ply"))
             
         
     def depth_peel(self, verts, tri, projection, c2ws, resolution, num_layers=4, znear=0.1, zfar=100):
@@ -445,15 +422,6 @@ class HOI_Sync:
         # Return the optimized PCA parameters
         new_pose = torch.concat([fullpose[:,:3], pca_params], dim=-1)
         
-        if self.vis_mid_results:
-            os.makedirs(os.path.join(self.out_dir, "pca"), exist_ok=True)
-            name = self.data['name']
-            mesh = trimesh.Trimesh(pred_verts.detach().squeeze().cpu(), self.hand_faces.cpu())
-            mesh.export(os.path.join(self.out_dir, "pca" , f"{name}_pca_hand.ply"))
-            
-            mesh = trimesh.Trimesh(gt_verts.detach().squeeze().cpu(), self.hand_faces.cpu())
-            mesh.export(os.path.join(self.out_dir, "pca" , f"{name}_gt_hand.ply"))
-            
         return new_pose.detach()
     
     def optim_handpose(self, pca_params, pca_params_orig, betas, mano_layer=None, iteration=None, total_iterations=None):
@@ -612,14 +580,6 @@ class HOI_Sync:
         self.mano_params['fullpose'] = best_fullpose.detach()
         self.mano_params['betas'] = betas.detach()
         self.global_params['hand'] = best_global_param
-        
-        name = self.data['name']
-        
-        if self.vis_mid_results:
-            pred_hand_mask = pred_hand_mask.cpu()
-            pred_hand_mask = ToPILImage(pred_hand_mask)
-            pred_hand_mask.save(osp.join(self.out_dir, 
-                                            f"midresult/test_hand_obj_cam/{name}_optim_non_global.png"))
     
     def run_handpose_global(self):
         """Stage2: optimize hand global translation."""
@@ -661,24 +621,6 @@ class HOI_Sync:
         self.mano_params['fullpose'] = best_fullpose
         self.global_params['hand'] = best_global_params
         self.mano_params['betas'] = betas.detach()
-        name = self.data['name']
-        
-        if self.vis_mid_results:
-            pred_hand_mask = pred_hand_mask.detach().cpu()
-            pred_hand_mask = ToPILImage(pred_hand_mask)
-            
-            pred_hand_mask.save(osp.join(self.out_dir, 
-                                            f"midresult/test_hand_obj_cam/{name}_optim.png"))
-            
-            init_hand_mask = init_hand_mask.detach().cpu()
-            init_hand_mask = ToPILImage(init_hand_mask)
-            init_hand_mask.save(osp.join(self.out_dir, 
-                                            f"midresult/test_hand_obj_cam/{name}_init.png"))
-            
-            gt_hand_mask = self.data["hamer_hand_mask"].cpu()
-            gt_hand_mask = ToPILImage(gt_hand_mask.float())
-            gt_hand_mask.save(osp.join(self.out_dir, 
-                                        f"midresult/test_hand_obj_cam/{name}_gt.png"))
                 
             
     def get_hand_contact(self, fullpose, betas):
@@ -737,23 +679,23 @@ class HOI_Sync:
                             'back': hand_normals_back,
                             'both': hand_normals}
         
-        if self.vis_mid_results:
-            name = self.data['name']
-            contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_front.png"))
-            
-            contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
-            contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_back.png"))
-            
-            image_utils.save_depth(hand_depth.detach(), 
-                                    os.path.join(self.out_dir, "contact", f"{name}_hand_depth"),
-                                    text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
-            
-            ids = torch.nonzero(contact_mask == 0)
-            hand_depth[:, :, ids[:,0], ids[:,1]] = 0
-            image_utils.save_depth(hand_depth.detach(), 
-                                    os.path.join(self.out_dir, "contact", f"{name}_filtered_hand_depth"),
-                                    text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
+        # save contact outputs
+        name = self.data['name']
+        contact_mask_img = ToPILImage(front_mask.detach().cpu().float())
+        contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_front.png"))
+        
+        contact_mask_img = ToPILImage(back_mask.detach().cpu().float())
+        contact_mask_img.save(os.path.join(self.out_dir, "contact", f"{name}_hand_mask_back.png"))
+        
+        image_utils.save_depth(hand_depth.detach(), 
+                                os.path.join(self.out_dir, "contact", f"{name}_hand_depth"),
+                                text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
+        
+        ids = torch.nonzero(contact_mask == 0)
+        hand_depth[:, :, ids[:,0], ids[:,1]] = 0
+        image_utils.save_depth(hand_depth.detach(), 
+                                os.path.join(self.out_dir, "contact", f"{name}_filtered_hand_depth"),
+                                text_list=["layer_0", "layer_1", "layer_2", "layer_3"])
         
         return hand_mesh_objcam, hand_verts_objcam, hand_contact, hand_contact_normal
     
