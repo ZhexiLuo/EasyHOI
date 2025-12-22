@@ -35,10 +35,10 @@ class HOI_Sync:
     # Loss weights
     DEFAULT_LOSS_WEIGHTS: Dict[str, float] = {
         "contact": 5.0,
-        "penetr": 20.0,
-        "loss_2d": 1.0,
-        "regularize": 2.0,
-        "error_3d": 10.0,
+        "penetr": 10.0,
+        "loss_2d": 5.0,
+        "regularize": 1.0,
+        "error_3d": 5.0,
         "error_2d": 1.0,
     }
     
@@ -121,7 +121,15 @@ class HOI_Sync:
         for subdir in subdirs:
             (self.out_dir / subdir).mkdir(parents=True, exist_ok=True)
 
-    
+    def __del__(self) -> None:
+        """Clean up CUDA resources to prevent hanging."""
+        try:
+            if hasattr(self, 'glctx'):
+                del self.glctx
+        except Exception:
+            pass
+
+
     def get_params_for(self, option):
         key = option
         res = {}
