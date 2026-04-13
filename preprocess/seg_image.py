@@ -339,10 +339,10 @@ def seg_after_inpaint_graphcut(data_dir, save_dir, datatype):
         fgd_model = np.zeros((1, 65), np.float64)
         mask[partial_mask > 0] = 1
 
-        # 应用Graph Cut算法
+        # Apply Graph Cut algorithm
         (mask, bgd_model, fgd_model)=cv2.grabCut(denoised_img, mask, None, bgd_model, fgd_model, 10, cv2.GC_INIT_WITH_MASK)
 
-        # 将结果转换为二值mask
+        # Convert result to binary mask
         full_mask = np.where((mask == cv2.GC_BGD) | (mask == cv2.GC_PR_BGD), 0, 1).astype('uint8')
         # full_mask = np.where((mask == cv2.GC_BGD), 0, 1).astype('uint8')
         

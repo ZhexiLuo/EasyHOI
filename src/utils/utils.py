@@ -122,3 +122,40 @@ def get_metric_value(metric_dict: Dict[str, Any], metric_name: Optional[str]) ->
     log.info(f"Retrieved metric value! <{metric_name}={metric_value}>")
 
     return metric_value
+
+
+def should_run_icp(current_iter: int, icp_iters_range) -> bool:
+    """
+    Determine whether ICP registration should run at the current iteration.
+
+    Supports two config formats:
+    1. Single range: [start, end] - run ICP within [start, end)
+    2. Multi range: [[start1, end1], [start2, end2], ...] - run ICP in multiple ranges
+
+    Args:
+        current_iter: Current iteration index.
+        icp_iters_range: ICP iteration range config.
+
+    Returns:
+        True if ICP should run at current_iter, False otherwise.
+
+    Examples:
+        >>> should_run_icp(1, [0, 5])              # True  (1 in [0,5))
+        >>> should_run_icp(5, [0, 5])              # False (5 not in [0,5))
+        >>> should_run_icp(1, [[0, 2], [5, 8]])    # True  (1 in [0,2))
+        >>> should_run_icp(3, [[0, 2], [5, 8]])    # False (3 not in any range)
+        >>> should_run_icp(6, [[0, 2], [5, 8]])    # True  (6 in [5,8))
+    """
+    if not icp_iters_range:
+        return False
+
+    # Check if multi-range format
+    if isinstance(icp_iters_range[0], (list, tuple)):
+        for start, end in icp_iters_range:
+            if start <= current_iter < end:
+                return True
+        return False
+    else:
+        # Single range format (backward compatible)
+        start, end = icp_iters_range
+        return start <= current_iter < end

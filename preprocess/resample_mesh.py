@@ -70,7 +70,7 @@ def save_depth_img(depth, outpath):
     cv2.imwrite(outpath, depth_colormap)
 
 def generate_depth_images(mesh_path, r=4.5, num_images=10):
-    # 加载mesh
+    # Load mesh
     mesh = trimesh.load(mesh_path)
     scene = pyrender.Scene()
     scene.add(pyrender.Mesh.from_trimesh(mesh))
@@ -85,10 +85,10 @@ def generate_depth_images(mesh_path, r=4.5, num_images=10):
     # light = pyrender.DirectionalLight(color=np.ones(3), intensity=3.0)
     # render_flags = RenderFlags.DEPTH_ONLY | RenderFlags.OFFSCREEN
 
-    # 渲染器
+    # Renderer
     renderer = pyrender.OffscreenRenderer(1000, 1000)
 
-    # 生成深度图和点云
+    # Generate depth images and point clouds
     point_clouds = []
     for i in range(num_images):
         ratio = float(i) /num_images
@@ -104,11 +104,11 @@ def generate_depth_images(mesh_path, r=4.5, num_images=10):
         camera_node = pyrender.Node(camera=camera, matrix=camera_matrix)
         scene.add_node(camera_node)
         
-        # 渲染深度图像
+        # Render depth image
         depth = renderer.render(scene, flags=RenderFlags.DEPTH_ONLY)
         # save_depth_img(depth, os.path.join(folder, f"depth_{i}.png"))
         
-        # 从深度图像生成点云
+        # Generate point cloud from depth image
         pc = o3d.geometry.PointCloud.create_from_depth_image(
             o3d.geometry.Image(depth),
             intrinsic=intrinsic,
@@ -154,109 +154,124 @@ def transfer_vertex_colors(mesh_a, mesh_b):
 def meshfix(infile, outfile, origin_file=None):
     mesh = trimesh.load(infile)
     MAX_FACE_NUM = 50000
-    if mesh.faces.shape[0]>MAX_FACE_NUM:
-        simp_mesh = mesh.simplify_quadratic_decimation(MAX_FACE_NUM)
-        mesh = transfer_vertex_colors(mesh, simp_mesh)
-        mesh.export(infile)
     
-    tin = pymeshfix.PyTMesh()
-    tin.clean(max_iters=10, inner_loops=3)
-    meshfix = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
-    print("created")
-    try:
-        meshfix.repair()
-    except:
-        print("repair failed")
-    
-    print("repair finished")
-    
-    tin.load_array(meshfix.v, meshfix.f)
-    tin.fill_small_boundaries()
-    tin.clean(max_iters=10, inner_loops=3)
-    v, f = tin.return_arrays()
-    new_mesh = trimesh.Trimesh(v, f)
-    
-    if origin_file is not None:
-        mesh = trimesh.load(origin_file)
-    new_mesh = transfer_vertex_colors(mesh, new_mesh)
-    new_mesh.export(outfile)
-    print(new_mesh.is_watertight)
-    
-def load_tripo(folder):
-    for model in tqdm(os.listdir(folder)):
-        if model.startswith('.'):
-            continue
-        tripo_dir = os.path.join(folder, model, "tripo")
-        obj_files = glob.glob(os.path.join(tripo_dir, '*.obj'))
-        # print(obj_files)
-        
-        if len(obj_files) == 0:
-            print(model)
-            continue
-        mesh = trimesh.load(obj_files[0])
-        
-        if hasattr(mesh.visual, 'uv'):
-            vertex_colors = mesh.visual.to_color().vertex_colors
-            mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, vertex_colors=vertex_colors)
+    # Check if mesh simplification is needed
+    if mesh.faces.shape[0] > MAX_FACE_NUM:
+        print(f"Too many faces ({mesh.faces.shape[0]} > {MAX_FACE_NUM}), attempting simplification...")
+        try:
+            # Calculate target simplification ratio (between 0 and 1)
+            target_ratio = MAX_FACE_NUM / mesh.faces.shape[0]
+            target_ratio = max(0.1, min(0.9, target_ratio))  # Ensure ratio is within reasonable range
             
-        mesh.export(os.path.join(folder, model, "full.obj"))
-
-def main(folder, resample=False):
-    
-    # folder = '/storage/group/4dvlab/yumeng/RealDex_easyhoi/obj_recon/results/instantmesh/instant-mesh-large/meshes/'
-    for model in tqdm(os.listdir(folder)):
-        if model.startswith('.'):
-            continue
-        data_dir = os.path.join(folder, model)
-        out_path =os.path.join(data_dir, 'recon.ply') 
-        pc_path =os.path.join(data_dir, 'recon_pc.ply') 
-        fixed_path = os.path.join(data_dir, 'fixed.obj') 
-        
-        orig_mesh_path = os.path.join(data_dir, "full.obj")
-        
-        print(orig_mesh_path)
-        
-        
-        if os.path.exists(fixed_path):
-            continue
-        
-        if resample:
-            try:
-                point_clouds = generate_depth_images(orig_mesh_path)
-                mesh = poisson_reconstruct(point_clouds)
-                o3d.io.write_triangle_mesh(out_path, mesh)
-                o3d.io.write_point_cloud(pc_path, point_clouds)
-                meshfix(out_path, fixed_path, orig_mesh_path)
-            except:
-                print(orig_mesh_path, " MeshFix Wrong")
-        else:
-            try:
-                mesh:trimesh.Trimesh = trimesh.load(os.path.join(data_dir, "full.obj"))
+            print(f"Target simplification ratio: {target_ratio:.3f}")
+            simp_mesh = mesh.simplify_quadric_decimation(target_ratio)
+            
+            if simp_mesh.faces.shape[0] < mesh.faces.shape[0]:
+                mesh = transfer_vertex_colors(mesh, simp_mesh)
+                mesh.export(infile)
+                print(f"Mesh simplification successful, faces reduced from {mesh.faces.shape[0]} to {simp_mesh.faces.shape[0]}")
+            else:
+                print("Face count not reduced after simplification, using original mesh")
                 
-                meshfix(orig_mesh_path, fixed_path)
-            except:
-                print(orig_mesh_path, " MeshFix Wrong")
+        except ImportError as e:
+            print(f"Warning: Missing simplification dependency ({e}), skipping simplification step")
+            print(f"Suggestion: pip install fast-simplification")
+        except Exception as e:
+            print(f"Warning: Mesh simplification failed ({e}), continuing with original mesh")
+    
+    try:
+        tin = pymeshfix.PyTMesh()
+        tin.clean(max_iters=10, inner_loops=3)
+        meshfix_obj = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
+        print("MeshFix object created")
         
+        try:
+            meshfix_obj.repair()
+            print("Mesh repair completed")
+        except Exception as e:
+            print(f"Warning during repair process: {e}")
+        
+        tin.load_array(meshfix_obj.v, meshfix_obj.f)
+        tin.fill_small_boundaries()
+        tin.clean(max_iters=10, inner_loops=3)
+        v, f = tin.return_arrays()
+        new_mesh = trimesh.Trimesh(v, f)
+        
+        if origin_file is not None:
+            original_mesh = trimesh.load(origin_file)
+            new_mesh = transfer_vertex_colors(original_mesh, new_mesh)
+        
+        new_mesh.export(outfile)
+        print(f"Is mesh watertight: {new_mesh.is_watertight}")
+    except Exception as e:
+        print(f"MeshFix processing failed: {e}")
+        # If MeshFix fails, save the original mesh as fallback
+        mesh.export(outfile)
+        print("Saved original mesh as fallback output")
+
+def load_tripo(file_path):
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return False
+    
+    mesh = trimesh.load(file_path)
+    
+    if hasattr(mesh.visual, 'uv'):
+        vertex_colors = mesh.visual.to_color().vertex_colors
+        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, vertex_colors=vertex_colors)
+    
+    output_dir = os.path.dirname(file_path)
+    output_path = os.path.join(output_dir, "full.obj")
+    mesh.export(output_path)
+    return True
+
+def main(file_path, resample=False):
+    if not os.path.exists(file_path):
+        print(f"File not found: {file_path}")
+        return
+    
+    data_dir = os.path.dirname(file_path)
+    out_path = os.path.join(data_dir, 'recon.ply') 
+    pc_path = os.path.join(data_dir, 'recon_pc.ply') 
+    fixed_path = os.path.join(data_dir, 'fixed.obj') 
+    
+    orig_mesh_path = os.path.join(data_dir, "full.obj")
+    
+    print(f"Processing file: {orig_mesh_path}")
+    
+    if os.path.exists(fixed_path):
+        print(f"Output already exists, skipping: {fixed_path}")
+        return
+    
+    if resample:
+        try:
+            point_clouds = generate_depth_images(orig_mesh_path)
+            mesh = poisson_reconstruct(point_clouds)
+            o3d.io.write_triangle_mesh(out_path, mesh)
+            o3d.io.write_point_cloud(pc_path, point_clouds)
+            meshfix(out_path, fixed_path, orig_mesh_path)
+        except Exception as e:
+            print(f"{orig_mesh_path} mesh repair failed: {e}")
+    else:
+        try:
+            mesh = trimesh.load(orig_mesh_path)
+            meshfix(orig_mesh_path, fixed_path)
+        except Exception as e:
+            print(f"{orig_mesh_path} mesh repair failed: {e}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Segementation.")
-    parser.add_argument('--data_dir', type=str, help='Path to the data to be processed')
+    parser.add_argument('--dir', type=str, help='Path to the data to be processed')
     parser.add_argument('--resample', action='store_true', help='Resample the point cloud using the depth camera')
     
     args = parser.parse_args()
     
-    folder = os.path.join(args.data_dir, "obj_recon/results/tripo/meshes/")
-    if os.path.exists(folder):
-        load_tripo(folder)
-        main(folder, False)
-    
-    folder = os.path.join(args.data_dir, "obj_recon/results/instantmesh/instant-mesh-large/meshes/")
-    if args.resample:
-        print("resample mesh using depth camera")
-        main(folder, True)
+    file = os.path.join(args.dir, "pc/scaled.obj")
+    if os.path.exists(file):
+        load_tripo(file)
+        main(file, False)
     else:
-        main(folder, False)
-        
+        print(f"Input file not found: {file}")
     
     
